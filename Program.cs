@@ -6,6 +6,21 @@ using System.Text.RegularExpressions;
 
 namespace DashCamSync;
 
+/// <summary>
+/// Docker configuration is in compose.yaml. Set each camera using a consecutive numbered
+/// IP/name pair, such as DASHCAM_CAMERA_1_IP and DASHCAM_CAMERA_1_NAME. To add a camera,
+/// add the next pair (for example, DASHCAM_CAMERA_3_IP and DASHCAM_CAMERA_3_NAME) under
+/// the service's environment section. Do not leave gaps in the numbering.
+/// <para>
+/// To choose where downloads are stored on the host, change DOWNLOADS_HOST_PATH or the
+/// host side of the volume entry below. Compose sets DASHCAM_DOWNLOAD_ROOT to the
+/// Synology path /volume1/Data/DashCam; outside Docker, the fallback is /Data/DashCam.
+/// </para>
+/// <code>
+/// volumes:
+///   - "${DOWNLOADS_HOST_PATH:-/volume1/Data/DashCam}:/volume1/Data/DashCam"
+/// </code>
+/// </summary>
 internal static class Program
 {
     private static readonly TimeSpan RetryDelay = TimeSpan.FromMinutes(5);
@@ -15,18 +30,18 @@ internal static class Program
         Timeout = TimeSpan.FromMinutes(30)
     };
 
+    private static readonly HttpClient CameraProbeHttpClient = new HttpClient()
+    {
+        Timeout = TimeSpan.FromSeconds(3)
+    };
+
     public static void Main()
     {
         string? configuredRoot = Environment.GetEnvironmentVariable("DASHCAM_DOWNLOAD_ROOT");
         string destinationRoot;
         if (string.IsNullOrWhiteSpace(configuredRoot))
         {
-            destinationRoot = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                "Library",
-                "Mobile Documents",
-                "com~apple~CloudDocs",
-                "DashCam Downloads");
+            destinationRoot = "./DashCamDownloads";
         }
         else
         {
@@ -43,10 +58,91 @@ internal static class Program
             return;
         }
 
-        Parallel.ForEach(
+        Dictionary<string, CameraProgress> cameraProgress = new Dictionary<string, CameraProgress>();
+        foreach (KeyValuePair<string, string> camera in cameras)
+        {
+            cameraProgress.Add(camera.Key, new CameraProgress(camera.Key, camera.Value));
+        }
+
+        WebApplicationBuilder builder = WebApplication.CreateBuilder();
+        string? configuredDashboardUrl = Environment.GetEnvironmentVariable("DASHCAM_DASHBOARD_URL");
+        if (string.IsNullOrWhiteSpace(configuredDashboardUrl))
+        {
+            configuredDashboardUrl = "http://127.0.0.1:8081";
+        }
+
+        builder.WebHost.UseUrls(configuredDashboardUrl);
+        WebApplication app = builder.Build();
+        app.UseDefaultFiles();
+        app.UseStaticFiles();
+        app.MapGet("/api/status", () =>
+        {
+            List<CameraSnapshot> snapshots = cameraProgress.Values
+                .Select(progress => progress.CreateSnapshot())
+                .OrderBy(snapshot => snapshot.CameraName, StringComparer.Ordinal)
+                .ToList();
+            int totalFiles = 0;
+            int completedFiles = 0;
+            int filesLeft = 0;
+            int scanningCameras = 0;
+            double aggregateSpeed = 0;
+            double overallProgress = 0;
+
+            foreach (CameraSnapshot snapshot in snapshots)
+            {
+                totalFiles += snapshot.TotalFiles;
+                completedFiles += snapshot.CompletedFiles;
+                filesLeft += snapshot.FilesLeft;
+                if (!snapshot.QueueReady)
+                {
+                    scanningCameras++;
+                }
+
+                aggregateSpeed += snapshot.BytesPerSecond;
+                overallProgress += snapshot.OverallProgressPercent * snapshot.TotalFiles;
+            }
+
+            if (totalFiles > 0)
+            {
+                overallProgress /= totalFiles;
+            }
+            else if (snapshots.Count > 0 && snapshots.All(snapshot => snapshot.TransferStatus == "Complete"))
+            {
+                overallProgress = 100;
+            }
+
+            return Results.Json(new DashboardSnapshot(
+                DateTime.UtcNow,
+                snapshots.Count,
+                totalFiles,
+                completedFiles,
+                filesLeft,
+                aggregateSpeed,
+                overallProgress,
+                scanningCameras,
+                snapshots));
+        });
+
+        Task.Run(() => Parallel.ForEach(
             cameras,
             (KeyValuePair<string, string> camera) =>
-                DownloadCamera(camera.Key, camera.Value, destinationRoot));
+                DownloadCamera(camera.Key, camera.Value, destinationRoot, cameraProgress[camera.Key])));
+
+        Console.WriteLine($"Starting dashboard on {configuredDashboardUrl}");
+        app.Lifetime.ApplicationStarted.Register(() =>
+        {
+            Console.WriteLine($"Dashboard listening on: {string.Join(", ", app.Urls)}");
+        });
+
+        try
+        {
+            app.Run();
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"Dashboard failed to start on {configuredDashboardUrl}: {ex}");
+            throw;
+        }
     }
 
     private static Dictionary<string, string> GetCameras()
@@ -56,84 +152,193 @@ internal static class Program
             { "192.168.1.58", "Impreza Dashcam" },
             { "192.168.1.57", "Forrester Dashcam" }
         };
+        bool requireCameraSettings = string.Equals(
+            Environment.GetEnvironmentVariable("DASHCAM_REQUIRE_CAMERA_SETTINGS"),
+            "true",
+            StringComparison.OrdinalIgnoreCase);
+        if (requireCameraSettings)
+        {
+            cameras.Clear();
+        }
+
         string? cameraConfiguration = Environment.GetEnvironmentVariable("CAMERAS_JSON");
-        if (string.IsNullOrWhiteSpace(cameraConfiguration))
+        if (!string.IsNullOrWhiteSpace(cameraConfiguration))
         {
-            return cameras;
-        }
-
-        Dictionary<string, string>? configuredCameras;
-        try
-        {
-            configuredCameras = JsonSerializer.Deserialize<Dictionary<string, string>>(cameraConfiguration);
-        }
-        catch (JsonException ex)
-        {
-            throw new InvalidOperationException("CAMERAS_JSON must be a JSON object mapping IP addresses to camera names.", ex);
-        }
-
-        if (configuredCameras is null)
-        {
-            throw new InvalidOperationException("CAMERAS_JSON must be a JSON object mapping IP addresses to camera names.");
-        }
-
-        foreach (KeyValuePair<string, string> camera in configuredCameras)
-        {
-            if (!IPAddress.TryParse(camera.Key, out IPAddress? parsedAddress)
-                || parsedAddress is null
-                || string.IsNullOrWhiteSpace(camera.Value))
+            Dictionary<string, string>? configuredCameras;
+            try
             {
-                throw new InvalidOperationException($"Invalid camera entry in CAMERAS_JSON: '{camera.Key}'. Provide a valid IP address and a non-empty camera name.");
+                configuredCameras = JsonSerializer.Deserialize<Dictionary<string, string>>(cameraConfiguration);
+            }
+            catch (JsonException ex)
+            {
+                throw new InvalidOperationException("CAMERAS_JSON must be a JSON object mapping IP addresses to camera names.", ex);
             }
 
-            cameras[camera.Key] = camera.Value;
+            if (configuredCameras is null)
+            {
+                throw new InvalidOperationException("CAMERAS_JSON must be a JSON object mapping IP addresses to camera names.");
+            }
+
+            foreach (KeyValuePair<string, string> camera in configuredCameras)
+            {
+                if (!IPAddress.TryParse(camera.Key, out IPAddress? parsedAddress)
+                    || parsedAddress is null
+                    || string.IsNullOrWhiteSpace(camera.Value))
+                {
+                    throw new InvalidOperationException($"Invalid camera entry in CAMERAS_JSON: '{camera.Key}'. Provide a valid IP address and a non-empty camera name.");
+                }
+
+                cameras[camera.Key] = camera.Value;
+            }
+        }
+
+        bool hasNumberedCameras = false;
+        for (int cameraNumber = 1; ; cameraNumber++)
+        {
+            string? cameraIp = Environment.GetEnvironmentVariable($"DASHCAM_CAMERA_{cameraNumber}_IP");
+            string? cameraName = Environment.GetEnvironmentVariable($"DASHCAM_CAMERA_{cameraNumber}_NAME");
+            if (string.IsNullOrWhiteSpace(cameraIp) && string.IsNullOrWhiteSpace(cameraName))
+            {
+                break;
+            }
+
+            if (!IPAddress.TryParse(cameraIp, out IPAddress? parsedAddress)
+                || parsedAddress is null
+                || string.IsNullOrWhiteSpace(cameraName)
+                || cameraName.StartsWith("ENTER_CAMERA_", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    $"Replace the ENTER_CAMERA placeholder values for DASHCAM_CAMERA_{cameraNumber}_IP and DASHCAM_CAMERA_{cameraNumber}_NAME with a valid IP address and camera name.");
+            }
+
+            if (!hasNumberedCameras)
+            {
+                cameras.Clear();
+                hasNumberedCameras = true;
+            }
+
+            cameras[cameraIp] = cameraName;
+        }
+
+        if (requireCameraSettings && cameras.Count == 0)
+        {
+            throw new InvalidOperationException(
+                "Camera settings are required in the container. Set DASHCAM_CAMERA_1_IP and DASHCAM_CAMERA_1_NAME, then add more numbered pairs as needed.");
         }
 
         return cameras;
     }
 
-    private static void DownloadCamera(string ipAddress, string cameraName, string destinationRoot)
+    private static void DownloadCamera(
+        string ipAddress,
+        string cameraName,
+        string destinationRoot,
+        CameraProgress progress)
     {
         Uri remoteRoot = new Uri($"http://{ipAddress}/DCIM/");
         string localRoot = Path.Combine(destinationRoot, cameraName);
+        CancellationTokenSource connectionMonitorCancellation = new CancellationTokenSource();
+        Task connectionMonitor = Task.Run(() => MonitorCameraConnection(
+            remoteRoot,
+            progress,
+            connectionMonitorCancellation.Token));
 
         try
         {
+            progress.SetTransferStatus("Scanning");
             CleanUpTemporaryFiles(localRoot, cameraName);
             string manifestPath = Path.Combine(localRoot, ".downloaded-files.json");
             Dictionary<string, DateTime> downloadedFiles = LoadDownloadedFiles(manifestPath, cameraName);
             List<DownloadCandidate> downloads = new List<DownloadCandidate>();
-            CollectDownloads(remoteRoot, localRoot, cameraName, downloads);
+            CollectDownloads(remoteRoot, localRoot, cameraName, downloads, progress);
 
             List<DownloadCandidate> oldestFirstDownloads = downloads
                 .OrderBy(download => download.FileTime)
                 .ThenBy(download => download.FileUri.AbsoluteUri, StringComparer.Ordinal)
                 .ToList();
+            int alreadyCompleteCount = 0;
+            foreach (DownloadCandidate download in oldestFirstDownloads)
+            {
+                if (downloadedFiles.ContainsKey(download.FileUri.AbsoluteUri)
+                    || File.Exists(download.DestinationPath))
+                {
+                    alreadyCompleteCount++;
+                }
+            }
+
+            progress.SetQueue(oldestFirstDownloads.Count, alreadyCompleteCount);
 
             foreach (DownloadCandidate download in oldestFirstDownloads)
             {
                 try
                 {
                     Directory.CreateDirectory(Path.GetDirectoryName(download.DestinationPath)!);
+                    bool wasAlreadyComplete = downloadedFiles.ContainsKey(download.FileUri.AbsoluteUri)
+                        || File.Exists(download.DestinationPath);
                     DownloadFile(
                         download.FileUri,
                         download.DestinationPath,
                         cameraName,
                         download.FileTime,
                         downloadedFiles,
-                        manifestPath);
+                        manifestPath,
+                        progress);
+                    if (!wasAlreadyComplete)
+                    {
+                        progress.CompleteFile();
+                    }
                 }
                 catch (Exception ex) when (IsDownloadException(ex))
                 {
+                    progress.MarkError(ex.Message);
                     PrintDownloadFailure(cameraName, download.FileUri, ex);
                 }
             }
 
+            progress.Finish();
             Console.WriteLine($"Files for {cameraName} are stored in: {localRoot}");
         }
         catch (Exception ex) when (IsDownloadException(ex))
         {
+            progress.MarkError(ex.Message);
             PrintDownloadFailure(cameraName, remoteRoot, ex);
+        }
+        finally
+        {
+            connectionMonitorCancellation.Cancel();
+            connectionMonitor.Wait();
+            connectionMonitorCancellation.Dispose();
+        }
+    }
+
+    private static void MonitorCameraConnection(Uri remoteRoot, CameraProgress progress, CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, remoteRoot);
+                using HttpResponseMessage response = CameraProbeHttpClient.Send(
+                    request,
+                    HttpCompletionOption.ResponseHeadersRead,
+                    cancellationToken);
+                progress.MarkConnected();
+            }
+            catch (Exception ex) when (
+                ex is HttpRequestException
+                || ex is OperationCanceledException
+                || ex is IOException)
+            {
+                if (!cancellationToken.IsCancellationRequested)
+                {
+                    progress.MarkDisconnected(ex.Message);
+                }
+            }
+
+            if (cancellationToken.WaitHandle.WaitOne(TimeSpan.FromSeconds(5)))
+            {
+                return;
+            }
         }
     }
 
@@ -166,10 +371,11 @@ internal static class Program
         Uri remoteDirectory,
         string localDirectory,
         string cameraName,
-        List<DownloadCandidate> downloads)
+        List<DownloadCandidate> downloads,
+        CameraProgress progress)
     {
         Directory.CreateDirectory(localDirectory);
-        List<RemoteEntry> entries = GetEntriesWithRetry(remoteDirectory, cameraName);
+        List<RemoteEntry> entries = GetEntriesWithRetry(remoteDirectory, cameraName, progress);
 
         foreach (RemoteEntry entry in entries)
         {
@@ -179,7 +385,7 @@ internal static class Program
                 if (entry.IsDirectory)
                 {
                     Uri childDirectory = new Uri(entry.Uri.AbsoluteUri.TrimEnd('/') + "/");
-                    CollectDownloads(childDirectory, localPath, cameraName, downloads);
+                    CollectDownloads(childDirectory, localPath, cameraName, downloads, progress);
                 }
                 else if (entry.FileTime is DateTime fileTime)
                 {
@@ -195,6 +401,7 @@ internal static class Program
             }
             catch (Exception ex) when (IsDownloadException(ex))
             {
+                progress.MarkError(ex.Message);
                 PrintDownloadFailure(cameraName, entry.Uri, ex);
             }
         }
@@ -206,7 +413,8 @@ internal static class Program
         string cameraName,
         DateTime fileTime,
         Dictionary<string, DateTime> downloadedFiles,
-        string manifestPath)
+        string manifestPath,
+        CameraProgress progress)
     {
         string downloadKey = fileUri.AbsoluteUri;
         if (downloadedFiles.ContainsKey(downloadKey))
@@ -243,16 +451,17 @@ internal static class Program
             Console.WriteLine($"Downloading for {cameraName}: {fileUri.AbsolutePath}");
         }
 
+        progress.BeginFile(fileUri.AbsolutePath, partialLength, null);
         while (true)
         {
             try
             {
-                DownloadToPartialFile(fileUri, partialPath, cameraName);
+                DownloadToPartialFile(fileUri, partialPath, cameraName, progress);
                 break;
             }
             catch (Exception ex) when (IsRetryableDownloadException(ex))
             {
-                WaitBeforeRetry(cameraName, fileUri, ex);
+                WaitBeforeRetry(cameraName, fileUri, ex, progress);
             }
         }
 
@@ -395,7 +604,11 @@ internal static class Program
         }
     }
 
-    private static void DownloadToPartialFile(Uri fileUri, string partialPath, string cameraName)
+    private static void DownloadToPartialFile(
+        Uri fileUri,
+        string partialPath,
+        string cameraName,
+        CameraProgress progress)
     {
         long partialLength = 0;
         if (File.Exists(partialPath))
@@ -410,6 +623,7 @@ internal static class Program
         }
 
         using HttpResponseMessage response = HttpClient.Send(request, HttpCompletionOption.ResponseHeadersRead);
+        progress.MarkConnected();
         if (response.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable && partialLength > 0)
         {
             System.Net.Http.Headers.ContentRangeHeaderValue? contentRange = response.Content.Headers.ContentRange;
@@ -420,7 +634,7 @@ internal static class Program
 
             File.Delete(partialPath);
             Console.WriteLine($"Restarting download because the remote file size changed: {fileUri.AbsolutePath}");
-            DownloadToPartialFile(fileUri, partialPath, cameraName);
+            DownloadToPartialFile(fileUri, partialPath, cameraName, progress);
             return;
         }
 
@@ -458,7 +672,7 @@ internal static class Program
         }
 
         using FileStream destination = new FileStream(partialPath, fileMode, FileAccess.Write);
-        CopyResponseToFile(source, destination, fileUri, cameraName, expectedLength);
+        CopyResponseToFile(source, destination, fileUri, cameraName, expectedLength, progress);
         destination.Flush();
 
         if (expectedLength.HasValue && destination.Length != expectedLength.Value)
@@ -474,10 +688,12 @@ internal static class Program
         Stream destination,
         Uri fileUri,
         string cameraName,
-        long? totalLength)
+        long? totalLength,
+        CameraProgress progress)
     {
         byte[] buffer = new byte[81920];
         Stopwatch progressTimer = Stopwatch.StartNew();
+        long startingLength = destination.Length;
         TimeSpan lastProgressReport = TimeSpan.Zero;
         int nextPercentageToReport = 5;
         if (totalLength.HasValue && totalLength.Value > 0)
@@ -505,6 +721,14 @@ internal static class Program
 
             destination.Write(buffer, 0, bytesRead);
 
+            double currentSpeed = 0;
+            if (progressTimer.Elapsed.TotalSeconds > 0)
+            {
+                currentSpeed = (destination.Length - startingLength) / progressTimer.Elapsed.TotalSeconds;
+            }
+
+            progress.UpdateFileProgress(destination.Length, totalLength, currentSpeed);
+
             if (totalLength.HasValue && totalLength.Value > 0)
             {
                 int percentage = (int)Math.Min(100d, (double)destination.Length * 100d / totalLength.Value);
@@ -524,26 +748,30 @@ internal static class Program
         }
     }
 
-    private static List<RemoteEntry> GetEntriesWithRetry(Uri remoteDirectory, string cameraName)
+    private static List<RemoteEntry> GetEntriesWithRetry(
+        Uri remoteDirectory,
+        string cameraName,
+        CameraProgress progress)
     {
         while (true)
         {
             try
             {
-                return GetEntries(remoteDirectory);
+                return GetEntries(remoteDirectory, progress);
             }
             catch (Exception ex) when (IsRetryableDownloadException(ex))
             {
-                WaitBeforeRetry(cameraName, remoteDirectory, ex);
+                WaitBeforeRetry(cameraName, remoteDirectory, ex, progress);
             }
         }
     }
 
-    private static List<RemoteEntry> GetEntries(Uri remoteDirectory)
+    private static List<RemoteEntry> GetEntries(Uri remoteDirectory, CameraProgress progress)
     {
         using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, remoteDirectory);
         using HttpResponseMessage response = HttpClient.Send(request);
         response.EnsureSuccessStatusCode();
+        progress.MarkConnected();
 
         using StreamReader reader = new StreamReader(response.Content.ReadAsStream());
         string html;
@@ -646,8 +874,13 @@ internal static class Program
         return exception is OperationCanceledException || exception is DownloadInterruptedException;
     }
 
-    private static void WaitBeforeRetry(string cameraName, Uri uri, Exception exception)
+    private static void WaitBeforeRetry(
+        string cameraName,
+        Uri uri,
+        Exception exception,
+        CameraProgress progress)
     {
+        progress.MarkRetrying(exception.Message);
         Console.Error.WriteLine(
             $"Connection interrupted for {cameraName} at {uri.AbsolutePath}: {exception.Message} Retrying in 5 minutes.");
         Thread.Sleep(RetryDelay);
@@ -661,6 +894,17 @@ internal static class Program
     private sealed record RemoteEntry(string Name, Uri Uri, bool IsDirectory, DateTime? FileTime);
 
     private sealed record DownloadCandidate(Uri FileUri, string DestinationPath, DateTime FileTime);
+
+    private sealed record DashboardSnapshot(
+        DateTime UpdatedAtUtc,
+        int CameraCount,
+        int TotalFiles,
+        int CompletedFiles,
+        int FilesLeft,
+        double AggregateBytesPerSecond,
+        double OverallProgressPercent,
+        int ScanningCameras,
+        IReadOnlyList<CameraSnapshot> Cameras);
 
     private sealed class DownloadInterruptedException : IOException
     {

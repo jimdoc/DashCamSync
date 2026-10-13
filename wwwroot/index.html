@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#172b2b">
+  <title>DashCamSync | Transfer Monitor</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="DashCamSync home">
+      <span class="brand-mark" aria-hidden="true">D</span>
+      <span>DashCam<span class="brand-light">Sync</span></span>
+    </a>
+    <div class="service-status">
+      <span class="live-dot" id="service-dot" aria-hidden="true"></span>
+      <span id="service-label">Connecting</span>
+      <span class="status-divider" aria-hidden="true"></span>
+      <span class="updated-label">Updated <time id="updated-at">--:--:--</time></span>
+    </div>
+  </header>
+
+  <main class="page-shell">
+    <section class="page-heading">
+      <div>
+        <p class="eyebrow">TRANSFER MONITOR</p>
+        <h1>Camera downloads</h1>
+      </div>
+      <div class="camera-count"><span class="count-number" id="camera-count">0</span><span>cameras</span></div>
+    </section>
+
+    <section class="summary" aria-label="All camera download totals">
+      <div class="summary-item">
+        <span class="summary-label">Combined speed</span>
+        <strong id="aggregate-speed">0 B/s</strong>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Files remaining</span>
+        <strong id="files-left">0</strong>
+      </div>
+      <div class="summary-item">
+        <span class="summary-label">Files complete</span>
+        <strong id="files-complete">0 <span class="summary-secondary">/ 0</span></strong>
+      </div>
+      <div class="summary-item summary-progress">
+        <div class="progress-heading"><span class="summary-label">Overall progress</span><strong id="overall-progress-label">0%</strong></div>
+        <div class="progress-track" role="progressbar" aria-label="Overall download progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="overall-progress-track">
+          <span class="progress-fill" id="overall-progress-fill"></span>
+        </div>
+      </div>
+    </section>
+
+    <section class="camera-section">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">SOURCES</p>
+          <h2>Camera activity</h2>
+        </div>
+        <span class="refresh-indicator"><span class="refresh-ring" aria-hidden="true"></span>Live status</span>
+      </div>
+      <div class="camera-list" id="camera-list" aria-live="polite">
+        <div class="empty-state">Waiting for camera status</div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>DashCamSync</span>
+    <span id="last-error" class="footer-message"></span>
+  </footer>
+  <script src="/dashboard.js" defer></script>
+</body>
+</html>
