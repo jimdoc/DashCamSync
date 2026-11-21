@@ -1,8 +1,11 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
+using Microsoft.AspNetCore.Mvc;
 using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Xml;
+using System.Xml.Linq;
 
 namespace DashCamSync;
 
@@ -23,17 +26,64 @@ namespace DashCamSync;
 /// </summary>
 internal static class Program
 {
-    private static readonly TimeSpan RetryDelay = TimeSpan.FromMinutes(5);
+    private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(10);
 
     private static readonly HttpClient HttpClient = new HttpClient()
     {
-        Timeout = TimeSpan.FromMinutes(30)
+        Timeout = TimeSpan.FromSeconds(60)
     };
 
     private static readonly HttpClient CameraProbeHttpClient = new HttpClient()
     {
         Timeout = TimeSpan.FromSeconds(3)
     };
+
+    private static readonly HttpClient CameraDeleteHttpClient = new HttpClient(new HttpClientHandler
+    {
+        AllowAutoRedirect = false
+    })
+    {
+        Timeout = TimeSpan.FromSeconds(15)
+    };
+
+    private static readonly string BuildVersion = GetBuildVersion();
+
+    private static readonly string BuildTimeUtc = GetBuildTimeUtc();
+
+    private static string GetBuildVersion()
+    {
+        System.Reflection.Assembly assembly = typeof(Program).Assembly;
+        System.Reflection.AssemblyInformationalVersionAttribute? attribute =
+            System.Reflection.CustomAttributeExtensions.GetCustomAttribute<System.Reflection.AssemblyInformationalVersionAttribute>(assembly);
+        if (attribute is null || string.IsNullOrWhiteSpace(attribute.InformationalVersion))
+        {
+            return "unknown";
+        }
+
+        string version = attribute.InformationalVersion;
+        int revisionSeparator = version.IndexOf('+');
+        if (revisionSeparator >= 0 && version.Length - revisionSeparator - 1 > 7)
+        {
+            version = version.Substring(0, revisionSeparator + 8);
+        }
+
+        return version;
+    }
+
+    private static string GetBuildTimeUtc()
+    {
+        System.Reflection.Assembly assembly = typeof(Program).Assembly;
+        foreach (System.Reflection.AssemblyMetadataAttribute metadata in
+            System.Reflection.CustomAttributeExtensions.GetCustomAttributes<System.Reflection.AssemblyMetadataAttribute>(assembly))
+        {
+            if (metadata.Key == "BuildTimestampUtc" && !string.IsNullOrWhiteSpace(metadata.Value))
+            {
+                return metadata.Value;
+            }
+        }
+
+        return "unknown";
+    }
 
     public static void Main()
     {
@@ -64,6 +114,27 @@ internal static class Program
             cameraProgress.Add(camera.Key, new CameraProgress(camera.Key, camera.Value));
         }
 
+        CameraSizeLimitStore sizeLimitStore;
+        try
+        {
+            sizeLimitStore = CameraSizeLimitStore.Load(destinationRoot);
+        }
+        catch (IOException ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return;
+        }
+
+        Dictionary<string, SemaphoreSlim> sizeLimitLocks = new Dictionary<string, SemaphoreSlim>(StringComparer.Ordinal);
+        Dictionary<string, CameraScanCoordinator> cameraScans = new Dictionary<string, CameraScanCoordinator>(StringComparer.Ordinal);
+        foreach (KeyValuePair<string, string> camera in cameras)
+        {
+            cameraProgress[camera.Key].SetMaxSizeGb(
+                CameraSizeLimitStore.ConvertBytesToGb(sizeLimitStore.Get(camera.Key)));
+            sizeLimitLocks.Add(camera.Key, new SemaphoreSlim(1, 1));
+            cameraScans.Add(camera.Key, new CameraScanCoordinator());
+        }
+
         WebApplicationBuilder builder = WebApplication.CreateBuilder();
         string? configuredDashboardUrl = Environment.GetEnvironmentVariable("DASHCAM_DASHBOARD_URL");
         if (string.IsNullOrWhiteSpace(configuredDashboardUrl))
@@ -74,9 +145,26 @@ internal static class Program
         builder.WebHost.UseUrls(configuredDashboardUrl);
         WebApplication app = builder.Build();
         app.UseDefaultFiles();
-        app.UseStaticFiles();
+        app.UseStaticFiles(new StaticFileOptions
+        {
+            OnPrepareResponse = context =>
+            {
+                context.Context.Response.Headers.CacheControl = "no-store, no-cache, must-revalidate";
+                context.Context.Response.Headers.Pragma = "no-cache";
+                context.Context.Response.Headers.Expires = "0";
+            }
+        });
         app.MapGet("/api/status", () =>
         {
+            foreach (KeyValuePair<string, string> camera in cameras)
+            {
+                DownloadStatistics statistics = DownloadStatistics.ReadFromDisk(
+                    Path.Combine(destinationRoot, camera.Value));
+                cameraProgress[camera.Key].SetOnDiskStatistics(statistics.FileCount, statistics.TotalBytes);
+                cameraProgress[camera.Key].SetMaxSizeGb(
+                    CameraSizeLimitStore.ConvertBytesToGb(sizeLimitStore.Get(camera.Key)));
+            }
+
             List<CameraSnapshot> snapshots = cameraProgress.Values
                 .Select(progress => progress.CreateSnapshot())
                 .OrderBy(snapshot => snapshot.CameraName, StringComparer.Ordinal)
@@ -120,14 +208,373 @@ internal static class Program
                 aggregateSpeed,
                 overallProgress,
                 scanningCameras,
-                snapshots));
+                snapshots,
+                BuildVersion,
+                BuildTimeUtc));
+        });
+        void QueueCameraScan(string ipAddress)
+        {
+            string cameraName = cameras[ipAddress];
+            _ = Task.Run(() => ScanCamera(
+                new Uri($"http://{ipAddress}/DCIM/"),
+                Path.Combine(destinationRoot, cameraName),
+                cameraName,
+                cameraProgress[ipAddress],
+                cameraScans[ipAddress],
+                sizeLimitStore,
+                sizeLimitLocks[ipAddress]));
+        }
+
+        app.MapPost("/api/cameras/{ipAddress}/scan", async (string ipAddress) =>
+        {
+            if (!cameras.ContainsKey(ipAddress))
+            {
+                return Results.NotFound(new { error = "Camera not found." });
+            }
+
+            CameraScanCoordinator cameraScan = cameraScans[ipAddress];
+            await cameraScan.PauseScanAsync();
+            try
+            {
+                cameraProgress[ipAddress].BeginScan();
+            }
+            finally
+            {
+                cameraScan.ResumeScan();
+                QueueCameraScan(ipAddress);
+            }
+
+            return Results.Accepted(value: new { message = "Camera rescan requested." });
+        });
+        app.MapGet("/api/cameras/{ipAddress}/files", (string ipAddress, string? path) =>
+        {
+            if (!cameras.ContainsKey(ipAddress))
+            {
+                return Results.NotFound(new { error = "Camera not found." });
+            }
+
+            if (!TryResolveCameraPath(ipAddress, path ?? string.Empty, isDirectory: true, out Uri? directoryUri)
+                || directoryUri is null)
+            {
+                return Results.BadRequest(new { error = "Invalid camera directory path." });
+            }
+
+            try
+            {
+                List<RemoteEntry> entries = GetEntries(directoryUri);
+                string directoryPath = path ?? string.Empty;
+                string cameraName = cameras[ipAddress];
+                string localRoot = Path.Combine(destinationRoot, cameraName);
+                string localDirectory = Path.Combine(
+                    new[] { localRoot }.Concat(directoryPath.Split('/', StringSplitOptions.RemoveEmptyEntries)).ToArray());
+                // Browsing must not rewrite the manifest while a scan may be updating it.
+                Dictionary<string, DateTime> downloadedFiles = ReadDownloadedFiles(
+                    Path.Combine(localRoot, ".downloaded-files.json"), cameraName, rewrite: false);
+                List<CameraFileEntry> files = entries
+                    .Select(entry => new CameraFileEntry(
+                        entry.Name,
+                        directoryPath.Length == 0 ? entry.Name : $"{directoryPath}/{entry.Name}",
+                        entry.IsDirectory,
+                        entry.FileTime,
+                        entry.SizeBytes,
+                        entry.SizeIsApproximate,
+                        entry.IsDirectory ? null : GetDownloadStatus(entry, localDirectory, downloadedFiles)))
+                    .ToList();
+                return Results.Json(files);
+            }
+            catch (Exception ex) when (IsDownloadException(ex))
+            {
+                Console.Error.WriteLine($"Unable to list files or download status for camera {ipAddress}: {ex.Message}");
+                return Results.Problem($"Unable to read the camera directory or download status: {ex.Message}", statusCode: StatusCodes.Status502BadGateway);
+            }
+        });
+        app.MapDelete("/api/cameras/{ipAddress}/files", async (
+            string ipAddress,
+            [FromBody] CameraFileDeleteRequest? request) =>
+        {
+            if (!cameras.ContainsKey(ipAddress))
+            {
+                return Results.NotFound(new { error = "Camera not found." });
+            }
+
+            if (request is null
+                || string.IsNullOrEmpty(request.Path)
+                || !TryResolveCameraPath(ipAddress, request.Path, isDirectory: false, out Uri? fileUri)
+                || fileUri is null)
+            {
+                return Results.BadRequest(new { error = "Invalid camera file path." });
+            }
+
+            if (!request.Confirmed)
+            {
+                return Results.BadRequest(new { error = "Confirm the deletion before deleting a camera file." });
+            }
+
+            string[] segments = request.Path.Split('/');
+            CameraScanCoordinator cameraScan = cameraScans[ipAddress];
+            await cameraScan.PauseScanAsync();
+            cameraProgress[ipAddress].PauseForDeletion();
+            try
+            {
+                string fileName = segments[^1];
+                string directoryPath = string.Join('/', segments.Take(segments.Length - 1));
+                if (!TryResolveCameraPath(ipAddress, directoryPath, isDirectory: true, out Uri? directoryUri)
+                    || directoryUri is null)
+                {
+                    return Results.NotFound(new { error = "Camera file not found." });
+                }
+
+                RemoteEntry? fileEntry = GetEntries(directoryUri)
+                    .FirstOrDefault(entry => !entry.IsDirectory && entry.Name == fileName);
+                if (fileEntry is null)
+                {
+                    return Results.NotFound(new { error = "Camera file not found." });
+                }
+
+                if (fileEntry.CameraFilePath is null)
+                {
+                    throw new IOException("The camera listing did not include the file's original path.");
+                }
+
+                (string? requestError, _) = await SendCameraDeleteRequest(
+                    ipAddress, request.Path, fileUri, fileEntry.CameraFilePath);
+
+                bool fileStillExists;
+                try
+                {
+                    fileStillExists = GetEntries(directoryUri)
+                        .Any(entry => entry.Name == fileName);
+                }
+                catch (Exception ex) when (IsDownloadException(ex))
+                {
+                    Console.Error.WriteLine($"Unable to verify deletion of {request.Path} from {ipAddress}: {ex.Message}");
+                    return Results.Problem(
+                        $"Deletion could not be verified; the file may still exist. {requestError} {ex.Message}".Trim(),
+                        statusCode: StatusCodes.Status502BadGateway);
+                }
+
+                if (fileStillExists)
+                {
+                    return Results.Problem(
+                        $"The file is still listed on the camera. {requestError}".Trim(),
+                        statusCode: StatusCodes.Status502BadGateway);
+                }
+
+                if (requestError is not null)
+                {
+                    return Results.Problem(
+                        $"The file is no longer listed, but the camera did not confirm deletion. {requestError}",
+                        statusCode: StatusCodes.Status502BadGateway);
+                }
+
+                return Results.Ok(new CameraFileDeleteResponse(request.Path));
+            }
+            catch (Exception ex) when (IsDownloadException(ex))
+            {
+                Console.Error.WriteLine($"Unable to delete camera file {request.Path} from {ipAddress}: {ex.Message}");
+                return Results.Problem($"Unable to delete the camera file: {ex.Message}", statusCode: StatusCodes.Status502BadGateway);
+            }
+            finally
+            {
+                cameraScan.ResumeScan();
+                QueueCameraScan(ipAddress);
+            }
+        });
+        app.MapPost("/api/cameras/{ipAddress}/files/delete-batch", async (
+            string ipAddress,
+            [FromBody] CameraFileBatchDeleteRequest? request) =>
+        {
+            if (!cameras.ContainsKey(ipAddress))
+            {
+                return Results.NotFound(new { error = "Camera not found." });
+            }
+
+            if (request?.Paths is null || request.Paths.Length == 0)
+            {
+                return Results.BadRequest(new { error = "Select at least one camera file." });
+            }
+
+            if (!request.Confirmed)
+            {
+                return Results.BadRequest(new { error = "Confirm the deletion before deleting camera files." });
+            }
+
+            List<(string Path, string Name, Uri FileUri)> files = new List<(string, string, Uri)>();
+            HashSet<string> uniquePaths = new HashSet<string>(StringComparer.Ordinal);
+            string? directoryPath = null;
+            foreach (string path in request.Paths)
+            {
+                if (string.IsNullOrEmpty(path)
+                    || !uniquePaths.Add(path)
+                    || !TryResolveCameraPath(ipAddress, path, isDirectory: false, out Uri? fileUri)
+                    || fileUri is null)
+                {
+                    return Results.BadRequest(new { error = "Invalid or duplicate camera file path." });
+                }
+
+                string[] segments = path.Split('/');
+                string fileDirectoryPath = string.Join('/', segments.Take(segments.Length - 1));
+                directoryPath ??= fileDirectoryPath;
+                if (!string.Equals(directoryPath, fileDirectoryPath, StringComparison.Ordinal))
+                {
+                    return Results.BadRequest(new { error = "Select files from one camera directory at a time." });
+                }
+
+                files.Add((path, segments[^1], fileUri));
+            }
+
+            if (!TryResolveCameraPath(ipAddress, directoryPath!, isDirectory: true, out Uri? directoryUri)
+                || directoryUri is null)
+            {
+                return Results.BadRequest(new { error = "Invalid camera directory path." });
+            }
+
+            CameraScanCoordinator cameraScan = cameraScans[ipAddress];
+            await cameraScan.PauseScanAsync();
+            cameraProgress[ipAddress].PauseForDeletion();
+            try
+            {
+                Dictionary<string, RemoteEntry> listedFiles = GetEntries(directoryUri)
+                    .Where(entry => !entry.IsDirectory)
+                    .ToDictionary(entry => entry.Name, StringComparer.Ordinal);
+                Dictionary<string, CameraFileBatchDeleteResult> results =
+                    new Dictionary<string, CameraFileBatchDeleteResult>(StringComparer.Ordinal);
+                List<(string Path, string Name, string? RequestError)> attempted =
+                    new List<(string, string, string?)>();
+                bool connectionFailed = false;
+                foreach ((string path, string name, Uri fileUri) in files)
+                {
+                    if (!listedFiles.TryGetValue(name, out RemoteEntry? entry))
+                    {
+                        results.Add(path, new CameraFileBatchDeleteResult(path, false, "Camera file not found."));
+                    }
+                    else if (entry.CameraFilePath is null)
+                    {
+                        results.Add(path, new CameraFileBatchDeleteResult(
+                            path, false, "The camera listing did not include the file's original path."));
+                    }
+                    else if (connectionFailed)
+                    {
+                        results.Add(path, new CameraFileBatchDeleteResult(
+                            path, false, "Not attempted because the camera connection failed."));
+                    }
+                    else
+                    {
+                        (string? requestError, bool transportFailure) = await SendCameraDeleteRequest(
+                            ipAddress, path, fileUri, entry.CameraFilePath);
+                        attempted.Add((path, name, requestError));
+                        connectionFailed = transportFailure;
+                    }
+                }
+
+                HashSet<string>? remainingNames = null;
+                string? verificationError = null;
+                if (attempted.Count > 0)
+                {
+                    try
+                    {
+                        remainingNames = GetEntries(directoryUri)
+                            .Select(entry => entry.Name)
+                            .ToHashSet(StringComparer.Ordinal);
+                    }
+                    catch (Exception ex) when (IsDownloadException(ex))
+                    {
+                        Console.Error.WriteLine($"Unable to verify batch deletion from {ipAddress}: {ex.Message}");
+                        verificationError = $"Deletion could not be verified; the file may still exist. {ex.Message}";
+                    }
+                }
+
+                foreach ((string path, string name, string? requestError) in attempted)
+                {
+                    string? error;
+                    if (verificationError is not null)
+                    {
+                        error = $"{verificationError} {requestError}".Trim();
+                    }
+                    else if (remainingNames!.Contains(name))
+                    {
+                        error = $"The file is still listed on the camera. {requestError}".Trim();
+                    }
+                    else if (requestError is not null)
+                    {
+                        error = $"The file is no longer listed, but the camera did not confirm deletion. {requestError}";
+                    }
+                    else
+                    {
+                        error = null;
+                    }
+
+                    results.Add(path, new CameraFileBatchDeleteResult(path, error is null, error));
+                }
+
+                return Results.Ok(new CameraFileBatchDeleteResponse(
+                    files.Select(file => results[file.Path]).ToList()));
+            }
+            catch (Exception ex) when (IsDownloadException(ex))
+            {
+                Console.Error.WriteLine($"Unable to delete camera files from {ipAddress}: {ex.Message}");
+                return Results.Problem($"Unable to delete the camera files: {ex.Message}", statusCode: StatusCodes.Status502BadGateway);
+            }
+            finally
+            {
+                cameraScan.ResumeScan();
+                QueueCameraScan(ipAddress);
+            }
+        });
+        app.MapPut("/api/cameras/{ipAddress}/size-limit", async (string ipAddress, CameraSizeLimitRequest? request) =>
+        {
+            if (!cameras.TryGetValue(ipAddress, out string? cameraName))
+            {
+                return Results.NotFound(new { error = "Camera not found." });
+            }
+
+            if (request is null
+                || !CameraSizeLimitStore.TryConvertGbToBytes(request.MaxSizeGb, out long maxSizeBytes))
+            {
+                return Results.BadRequest(new { error = "Max size must be a non-negative number of gigabytes." });
+            }
+
+            SemaphoreSlim sizeLimitLock = sizeLimitLocks[ipAddress];
+            await sizeLimitLock.WaitAsync();
+            try
+            {
+                sizeLimitStore.Set(ipAddress, maxSizeBytes);
+                cameraProgress[ipAddress].SetMaxSizeGb(request.MaxSizeGb);
+                IReadOnlyList<string> deletedPaths = CameraDiskUsageReader.TrimOldestFiles(
+                    Path.Combine(destinationRoot, cameraName),
+                    maxSizeBytes);
+                cameraProgress[ipAddress].SetStorageCleanupStatus(deletedPaths);
+                DownloadStatistics statistics = DownloadStatistics.ReadFromDisk(Path.Combine(destinationRoot, cameraName));
+                cameraProgress[ipAddress].SetOnDiskStatistics(statistics.FileCount, statistics.TotalBytes);
+                bool limitStillExceeded = maxSizeBytes > 0 && statistics.TotalBytes > maxSizeBytes;
+                return Results.Ok(new CameraSizeLimitResponse(request.MaxSizeGb, deletedPaths, limitStillExceeded));
+            }
+            catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+            {
+                Console.Error.WriteLine($"Unable to enforce the size limit for {cameraName}: {ex.Message}");
+                return Results.Problem(
+                    $"The limit was saved, but cleanup could not be completed: {ex.Message}",
+                    statusCode: StatusCodes.Status500InternalServerError);
+            }
+            finally
+            {
+                sizeLimitLock.Release();
+            }
         });
 
         Task.Run(() => Parallel.ForEach(
             cameras,
             (KeyValuePair<string, string> camera) =>
-                DownloadCamera(camera.Key, camera.Value, destinationRoot, cameraProgress[camera.Key])));
+                DownloadCamera(
+                    camera.Key,
+                    camera.Value,
+                    destinationRoot,
+                    cameraProgress[camera.Key],
+                    sizeLimitStore,
+                    sizeLimitLocks[camera.Key],
+                    cameraScans[camera.Key])));
 
+        Console.WriteLine($"DashCamSync version {BuildVersion} (built {BuildTimeUtc})");
         Console.WriteLine($"Starting dashboard on {configuredDashboardUrl}");
         app.Lifetime.ApplicationStarted.Register(() =>
         {
@@ -233,70 +680,116 @@ internal static class Program
         string ipAddress,
         string cameraName,
         string destinationRoot,
-        CameraProgress progress)
+        CameraProgress progress,
+        CameraSizeLimitStore sizeLimitStore,
+        SemaphoreSlim sizeLimitLock,
+        CameraScanCoordinator scanCoordinator)
     {
         Uri remoteRoot = new Uri($"http://{ipAddress}/DCIM/");
         string localRoot = Path.Combine(destinationRoot, cameraName);
-        CancellationTokenSource connectionMonitorCancellation = new CancellationTokenSource();
-        Task connectionMonitor = Task.Run(() => MonitorCameraConnection(
-            remoteRoot,
-            progress,
-            connectionMonitorCancellation.Token));
+        progress.Reconnected += () => Task.Run(() => ScanCamera(
+            remoteRoot, localRoot, cameraName, progress, scanCoordinator, sizeLimitStore, sizeLimitLock));
+        // The monitor keeps running after downloads finish so the dashboard reflects live connectivity.
+        Task.Run(() => MonitorCameraConnection(remoteRoot, progress, CancellationToken.None));
+        ScanCamera(remoteRoot, localRoot, cameraName, progress, scanCoordinator, sizeLimitStore, sizeLimitLock);
+    }
 
+    private static void ScanCamera(
+        Uri remoteRoot,
+        string localRoot,
+        string cameraName,
+        CameraProgress progress,
+        CameraScanCoordinator scanCoordinator,
+        CameraSizeLimitStore sizeLimitStore,
+        SemaphoreSlim sizeLimitLock)
+    {
+        using CancellationTokenSource? scanCancellation = scanCoordinator.BeginScan();
+        if (scanCancellation is null)
+        {
+            return;
+        }
+
+        CancellationToken cancellationToken = scanCancellation.Token;
         try
         {
-            progress.SetTransferStatus("Scanning");
+            cancellationToken.ThrowIfCancellationRequested();
+            progress.BeginScan();
+            sizeLimitLock.Wait(cancellationToken);
+            try
+            {
+                IReadOnlyList<string> deletedPaths = CameraDiskUsageReader.TrimOldestFiles(
+                    localRoot,
+                    sizeLimitStore.Get(progress.IpAddress));
+                progress.SetStorageCleanupStatus(deletedPaths);
+            }
+            finally
+            {
+                sizeLimitLock.Release();
+            }
+
             CleanUpTemporaryFiles(localRoot, cameraName);
             string manifestPath = Path.Combine(localRoot, ".downloaded-files.json");
             Dictionary<string, DateTime> downloadedFiles = LoadDownloadedFiles(manifestPath, cameraName);
             List<DownloadCandidate> downloads = new List<DownloadCandidate>();
-            CollectDownloads(remoteRoot, localRoot, cameraName, downloads, progress);
+            CollectDownloads(remoteRoot, localRoot, cameraName, downloads, progress, cancellationToken);
 
-            List<DownloadCandidate> oldestFirstDownloads = downloads
+            List<DownloadCandidate> prioritizedDownloads = downloads
                 .OrderBy(download => download.FileTime)
                 .ThenBy(download => download.FileUri.AbsoluteUri, StringComparer.Ordinal)
                 .ToList();
-            int alreadyCompleteCount = 0;
-            foreach (DownloadCandidate download in oldestFirstDownloads)
+            int pendingFileCount = 0;
+            foreach (DownloadCandidate download in prioritizedDownloads)
             {
-                if (downloadedFiles.ContainsKey(download.FileUri.AbsoluteUri)
-                    || File.Exists(download.DestinationPath))
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!downloadedFiles.ContainsKey(download.FileUri.AbsoluteUri)
+                    && !File.Exists(download.DestinationPath))
                 {
-                    alreadyCompleteCount++;
+                    pendingFileCount++;
                 }
             }
 
-            progress.SetQueue(oldestFirstDownloads.Count, alreadyCompleteCount);
+            progress.SetQueue(pendingFileCount);
+            HashSet<string> measuredFiles = MeasureQueueBytes(prioritizedDownloads, downloadedFiles, progress, cancellationToken);
 
-            foreach (DownloadCandidate download in oldestFirstDownloads)
+            foreach (DownloadCandidate download in prioritizedDownloads)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
                     Directory.CreateDirectory(Path.GetDirectoryName(download.DestinationPath)!);
-                    bool wasAlreadyComplete = downloadedFiles.ContainsKey(download.FileUri.AbsoluteUri)
-                        || File.Exists(download.DestinationPath);
-                    DownloadFile(
+                    long? completedLength = DownloadFile(
                         download.FileUri,
                         download.DestinationPath,
+                        localRoot,
                         cameraName,
                         download.FileTime,
                         downloadedFiles,
                         manifestPath,
-                        progress);
-                    if (!wasAlreadyComplete)
+                        progress,
+                        sizeLimitStore,
+                        sizeLimitLock,
+                        cancellationToken);
+                    if (completedLength.HasValue)
                     {
-                        progress.CompleteFile();
+                        progress.CompleteFile(
+                            completedLength.Value,
+                            measuredFiles.Contains(download.FileUri.AbsoluteUri));
                     }
                 }
-                catch (Exception ex) when (IsDownloadException(ex))
+                catch (Exception ex) when (IsDownloadException(ex) && !cancellationToken.IsCancellationRequested)
                 {
                     progress.MarkError(ex.Message);
                     PrintDownloadFailure(cameraName, download.FileUri, ex);
                 }
             }
 
+            cancellationToken.ThrowIfCancellationRequested();
             progress.Finish();
             Console.WriteLine($"Files for {cameraName} are stored in: {localRoot}");
+        }
+        catch (Exception ex) when (IsDownloadException(ex) && cancellationToken.IsCancellationRequested)
+        {
+            Console.WriteLine($"Interrupted the scan for {cameraName}; it will be restarted.");
         }
         catch (Exception ex) when (IsDownloadException(ex))
         {
@@ -305,9 +798,74 @@ internal static class Program
         }
         finally
         {
-            connectionMonitorCancellation.Cancel();
-            connectionMonitor.Wait();
-            connectionMonitorCancellation.Dispose();
+            scanCoordinator.EndScan(scanCancellation);
+        }
+    }
+
+    private static HashSet<string> MeasureQueueBytes(
+        List<DownloadCandidate> downloads,
+        Dictionary<string, DateTime> downloadedFiles,
+        CameraProgress progress,
+        CancellationToken cancellationToken)
+    {
+        HashSet<string> measuredFiles = new HashSet<string>(StringComparer.Ordinal);
+        long totalBytes = 0;
+        long completedBytes = 0;
+        bool incomplete = false;
+        foreach (DownloadCandidate download in downloads)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            string downloadKey = download.FileUri.AbsoluteUri;
+            if (downloadedFiles.ContainsKey(downloadKey) || File.Exists(download.DestinationPath))
+            {
+                continue;
+            }
+
+            if (incomplete)
+            {
+                continue;
+            }
+
+            long? remoteLength = GetRemoteLength(download.FileUri, cancellationToken);
+            if (remoteLength.HasValue)
+            {
+                totalBytes += remoteLength.Value;
+                measuredFiles.Add(downloadKey);
+            }
+            else
+            {
+                // One failed probe usually means the camera is unreachable; stop rather than time out per file.
+                incomplete = true;
+            }
+
+            if (measuredFiles.Count % 25 == 0)
+            {
+                progress.SetQueueBytes(totalBytes, completedBytes, incomplete);
+            }
+        }
+
+        progress.SetQueueBytes(totalBytes, completedBytes, incomplete);
+        return measuredFiles;
+    }
+
+    private static long? GetRemoteLength(Uri fileUri, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Head, fileUri);
+            using HttpResponseMessage response = CameraProbeHttpClient.Send(
+                request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            return response.Content.Headers.ContentLength;
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested
+            && (ex is HttpRequestException || ex is OperationCanceledException || ex is IOException))
+        {
+            return null;
         }
     }
 
@@ -322,12 +880,10 @@ internal static class Program
                     request,
                     HttpCompletionOption.ResponseHeadersRead,
                     cancellationToken);
+                response.EnsureSuccessStatusCode();
                 progress.MarkConnected();
             }
-            catch (Exception ex) when (
-                ex is HttpRequestException
-                || ex is OperationCanceledException
-                || ex is IOException)
+            catch (Exception ex)
             {
                 if (!cancellationToken.IsCancellationRequested)
                 {
@@ -372,26 +928,26 @@ internal static class Program
         string localDirectory,
         string cameraName,
         List<DownloadCandidate> downloads,
-        CameraProgress progress)
+        CameraProgress progress,
+        CancellationToken cancellationToken)
     {
         Directory.CreateDirectory(localDirectory);
-        List<RemoteEntry> entries = GetEntriesWithRetry(remoteDirectory, cameraName, progress);
+        List<RemoteEntry> entries = GetEntriesWithRetry(remoteDirectory, cameraName, progress, cancellationToken);
 
         foreach (RemoteEntry entry in entries)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             string localPath = Path.Combine(localDirectory, entry.Name);
             try
             {
                 if (entry.IsDirectory)
                 {
                     Uri childDirectory = new Uri(entry.Uri.AbsoluteUri.TrimEnd('/') + "/");
-                    CollectDownloads(childDirectory, localPath, cameraName, downloads, progress);
+                    CollectDownloads(childDirectory, localPath, cameraName, downloads, progress, cancellationToken);
                 }
                 else if (entry.FileTime is DateTime fileTime)
                 {
-                    string dateDirectoryName = fileTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
-                    string dateDirectory = Path.Combine(localDirectory, dateDirectoryName);
-                    string destinationPath = Path.Combine(dateDirectory, entry.Name);
+                    string destinationPath = GetDownloadDestinationPath(localDirectory, entry.Name, fileTime);
                     downloads.Add(new DownloadCandidate(entry.Uri, destinationPath, fileTime));
                 }
                 else
@@ -399,7 +955,7 @@ internal static class Program
                     Console.WriteLine($"Skipping {entry.Uri.AbsolutePath}: filetime is missing.");
                 }
             }
-            catch (Exception ex) when (IsDownloadException(ex))
+            catch (Exception ex) when (IsDownloadException(ex) && !cancellationToken.IsCancellationRequested)
             {
                 progress.MarkError(ex.Message);
                 PrintDownloadFailure(cameraName, entry.Uri, ex);
@@ -407,14 +963,18 @@ internal static class Program
         }
     }
 
-    private static void DownloadFile(
+    private static long? DownloadFile(
         Uri fileUri,
         string destinationPath,
+        string localRoot,
         string cameraName,
         DateTime fileTime,
         Dictionary<string, DateTime> downloadedFiles,
         string manifestPath,
-        CameraProgress progress)
+        CameraProgress progress,
+        CameraSizeLimitStore sizeLimitStore,
+        SemaphoreSlim sizeLimitLock,
+        CancellationToken cancellationToken)
     {
         string downloadKey = fileUri.AbsoluteUri;
         if (downloadedFiles.ContainsKey(downloadKey))
@@ -425,14 +985,15 @@ internal static class Program
             }
 
             Console.WriteLine($"Previously downloaded; skipping for {cameraName}: {destinationPath}");
-            return;
+            return null;
         }
 
         if (File.Exists(destinationPath))
         {
             File.SetLastWriteTime(destinationPath, fileTime);
-            Console.WriteLine($"Already downloaded for {cameraName}: {destinationPath}");
-            return;
+            SaveDownloadedFile(downloadKey, downloadedFiles, manifestPath);
+            Console.WriteLine($"File already exists; skipping for {cameraName}: {destinationPath}");
+            return null;
         }
 
         string partialPath = destinationPath + ".download";
@@ -454,24 +1015,71 @@ internal static class Program
         progress.BeginFile(fileUri.AbsolutePath, partialLength, null);
         while (true)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                DownloadToPartialFile(fileUri, partialPath, cameraName, progress);
+                DownloadToPartialFile(fileUri, partialPath, cameraName, progress, cancellationToken);
                 break;
             }
-            catch (Exception ex) when (IsRetryableDownloadException(ex))
+            catch (Exception ex) when (IsRetryableDownloadException(ex) && !cancellationToken.IsCancellationRequested)
             {
-                WaitBeforeRetry(cameraName, fileUri, ex, progress);
+                WaitBeforeRetry(cameraName, fileUri, ex, progress, cancellationToken);
             }
         }
 
-        File.SetLastWriteTime(partialPath, fileTime);
-        File.Move(partialPath, destinationPath);
-        SaveDownloadedFile(downloadKey, downloadedFiles, manifestPath);
+        long completedLength;
+        cancellationToken.ThrowIfCancellationRequested();
+        sizeLimitLock.Wait(cancellationToken);
+        try
+        {
+            completedLength = new FileInfo(partialPath).Length;
+            File.SetLastWriteTime(partialPath, fileTime);
+            File.Move(partialPath, destinationPath, true);
+            SaveDownloadedFile(downloadKey, downloadedFiles, manifestPath);
+            IReadOnlyList<string> deletedPaths = CameraDiskUsageReader.TrimOldestFiles(
+                localRoot,
+                sizeLimitStore.Get(progress.IpAddress));
+            progress.SetStorageCleanupStatus(deletedPaths);
+        }
+        finally
+        {
+            sizeLimitLock.Release();
+        }
+
         Console.WriteLine($"Downloaded for {cameraName}: {destinationPath}");
+        return completedLength;
+    }
+
+    private static string GetDownloadDestinationPath(string localDirectory, string fileName, DateTime fileTime)
+    {
+        return Path.Combine(localDirectory, fileTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture), fileName);
+    }
+
+    private static string GetDownloadStatus(
+        RemoteEntry entry,
+        string localDirectory,
+        Dictionary<string, DateTime> downloadedFiles)
+    {
+        if (entry.FileTime is DateTime fileTime
+            && File.Exists(GetDownloadDestinationPath(localDirectory, entry.Name, fileTime)))
+        {
+            return "downloaded";
+        }
+
+        if (downloadedFiles.ContainsKey(entry.Uri.AbsoluteUri))
+        {
+            return entry.FileTime.HasValue ? "previouslyDownloaded" : "previouslyDownloadedUnknown";
+        }
+
+        return entry.FileTime.HasValue ? "notDownloaded" : "unknown";
     }
 
     private static Dictionary<string, DateTime> LoadDownloadedFiles(string manifestPath, string cameraName)
+    {
+        return ReadDownloadedFiles(manifestPath, cameraName, rewrite: true);
+    }
+
+    private static Dictionary<string, DateTime> ReadDownloadedFiles(string manifestPath, string cameraName, bool rewrite)
     {
         if (!File.Exists(manifestPath))
         {
@@ -550,10 +1158,13 @@ internal static class Program
         if (expiredFiles.Count > 0)
         {
             needsRewrite = true;
-            Console.WriteLine($"Removed {expiredFiles.Count} download records older than one year for {cameraName}.");
+            if (rewrite)
+            {
+                Console.WriteLine($"Removed {expiredFiles.Count} download records older than one year for {cameraName}.");
+            }
         }
 
-        if (needsRewrite)
+        if (rewrite && needsRewrite)
         {
             WriteDownloadedFiles(manifestPath, downloadedFiles);
         }
@@ -608,7 +1219,8 @@ internal static class Program
         Uri fileUri,
         string partialPath,
         string cameraName,
-        CameraProgress progress)
+        CameraProgress progress,
+        CancellationToken cancellationToken)
     {
         long partialLength = 0;
         if (File.Exists(partialPath))
@@ -622,7 +1234,8 @@ internal static class Program
             request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(partialLength, null);
         }
 
-        using HttpResponseMessage response = HttpClient.Send(request, HttpCompletionOption.ResponseHeadersRead);
+        using HttpResponseMessage response = HttpClient.Send(
+            request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
         progress.MarkConnected();
         if (response.StatusCode == System.Net.HttpStatusCode.RequestedRangeNotSatisfiable && partialLength > 0)
         {
@@ -634,7 +1247,7 @@ internal static class Program
 
             File.Delete(partialPath);
             Console.WriteLine($"Restarting download because the remote file size changed: {fileUri.AbsolutePath}");
-            DownloadToPartialFile(fileUri, partialPath, cameraName, progress);
+            DownloadToPartialFile(fileUri, partialPath, cameraName, progress, cancellationToken);
             return;
         }
 
@@ -672,7 +1285,7 @@ internal static class Program
         }
 
         using FileStream destination = new FileStream(partialPath, fileMode, FileAccess.Write);
-        CopyResponseToFile(source, destination, fileUri, cameraName, expectedLength, progress);
+        CopyResponseToFile(source, destination, fileUri, cameraName, expectedLength, progress, cancellationToken);
         destination.Flush();
 
         if (expectedLength.HasValue && destination.Length != expectedLength.Value)
@@ -689,9 +1302,10 @@ internal static class Program
         Uri fileUri,
         string cameraName,
         long? totalLength,
-        CameraProgress progress)
+        CameraProgress progress,
+        CancellationToken cancellationToken)
     {
-        byte[] buffer = new byte[81920];
+        byte[] buffer = new byte[1024 * 1024];
         Stopwatch progressTimer = Stopwatch.StartNew();
         long startingLength = destination.Length;
         TimeSpan lastProgressReport = TimeSpan.Zero;
@@ -704,12 +1318,17 @@ internal static class Program
 
         while (true)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             int bytesRead;
             try
             {
-                bytesRead = source.Read(buffer, 0, buffer.Length);
+                // A camera that drops off the network otherwise leaves this read blocked indefinitely.
+                using CancellationTokenSource readTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                readTimeout.CancelAfter(TimeSpan.FromSeconds(30));
+                bytesRead = source.ReadAsync(buffer.AsMemory(), readTimeout.Token).AsTask().GetAwaiter().GetResult();
             }
-            catch (Exception ex) when (ex is IOException || ex is HttpRequestException || ex is OperationCanceledException)
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested
+                && (ex is IOException || ex is HttpRequestException || ex is OperationCanceledException))
             {
                 throw new DownloadInterruptedException(fileUri, ex);
             }
@@ -751,46 +1370,247 @@ internal static class Program
     private static List<RemoteEntry> GetEntriesWithRetry(
         Uri remoteDirectory,
         string cameraName,
-        CameraProgress progress)
+        CameraProgress progress,
+        CancellationToken cancellationToken)
     {
         while (true)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                return GetEntries(remoteDirectory, progress);
+                return GetEntries(remoteDirectory, progress, cancellationToken);
             }
-            catch (Exception ex) when (IsRetryableDownloadException(ex))
+            catch (Exception ex) when (IsRetryableDownloadException(ex) && !cancellationToken.IsCancellationRequested)
             {
-                WaitBeforeRetry(cameraName, remoteDirectory, ex, progress);
+                WaitBeforeRetry(cameraName, remoteDirectory, ex, progress, cancellationToken);
             }
         }
     }
 
-    private static List<RemoteEntry> GetEntries(Uri remoteDirectory, CameraProgress progress)
+    private static List<RemoteEntry> GetEntries(
+        Uri remoteDirectory,
+        CameraProgress? progress = null,
+        CancellationToken cancellationToken = default)
+    {
+        UriBuilder cameraRootBuilder = new UriBuilder(remoteDirectory)
+        {
+            Path = "/DCIM/",
+            Query = string.Empty,
+            Fragment = string.Empty
+        };
+        Uri cameraRoot = cameraRootBuilder.Uri;
+        if (!cameraRoot.IsBaseOf(remoteDirectory))
+        {
+            throw new IOException("The camera directory is outside the DCIM folder.");
+        }
+
+        Uri listingUri = new UriBuilder(remoteDirectory)
+        {
+            Path = "/",
+            Query = "custom=1&cmd=3015",
+            Fragment = string.Empty
+        }.Uri;
+        using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, listingUri);
+        using HttpResponseMessage response = HttpClient.Send(request, cancellationToken);
+        response.EnsureSuccessStatusCode();
+        progress?.MarkConnected();
+
+        using StreamReader reader = new StreamReader(response.Content.ReadAsStream());
+        string xml;
+        try
+        {
+            xml = reader.ReadToEndAsync(cancellationToken).GetAwaiter().GetResult();
+        }
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested
+            && (ex is IOException || ex is HttpRequestException || ex is OperationCanceledException))
+        {
+            throw new DownloadInterruptedException(listingUri, ex);
+        }
+
+        XDocument listing;
+        try
+        {
+            using StringReader stringReader = new StringReader(xml);
+            using XmlReader xmlReader = XmlReader.Create(stringReader, new XmlReaderSettings
+            {
+                DtdProcessing = DtdProcessing.Prohibit,
+                XmlResolver = null
+            });
+            listing = XDocument.Load(xmlReader);
+        }
+        catch (XmlException ex)
+        {
+            throw new IOException("The camera returned an invalid XML file listing.", ex);
+        }
+
+        if (listing.Root?.Name != "LIST")
+        {
+            throw new IOException("The camera returned an unexpected XML file listing.");
+        }
+
+        string relativeDirectory = Uri.UnescapeDataString(
+            cameraRoot.MakeRelativeUri(remoteDirectory).ToString()).TrimEnd('/');
+        string[] directorySegments = relativeDirectory.Length == 0
+            ? Array.Empty<string>()
+            : relativeDirectory.Split('/');
+        Dictionary<string, RemoteEntry> entries = new Dictionary<string, RemoteEntry>(StringComparer.Ordinal);
+        Dictionary<string, XElement> fileRecords = new Dictionary<string, XElement>(StringComparer.Ordinal);
+        string? cameraFilePathPrefix = null;
+
+        foreach (XElement file in listing.Root.Descendants("File"))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            string name = file.Element("NAME")?.Value.Trim() ?? string.Empty;
+            string filePath = file.Element("FPATH")?.Value.Trim() ?? string.Empty;
+            string[] fileSegments = GetCameraRelativeFileSegments(filePath);
+            cameraFilePathPrefix ??= GetCameraFilePathPrefix(filePath);
+            if (name.Length == 0 || !string.Equals(name, fileSegments[^1], StringComparison.Ordinal))
+            {
+                throw new IOException("The camera returned a file with an invalid name or path.");
+            }
+
+            if (fileSegments.Length <= directorySegments.Length
+                || !directorySegments.SequenceEqual(
+                    fileSegments.Take(directorySegments.Length),
+                    StringComparer.Ordinal))
+            {
+                continue;
+            }
+
+            int childSegmentCount = directorySegments.Length + 1;
+            string childName = fileSegments[directorySegments.Length];
+            bool isDirectory = fileSegments.Length > childSegmentCount;
+            string childPath = string.Join('/', fileSegments
+                .Take(childSegmentCount)
+                .Select(Uri.EscapeDataString));
+            Uri entryUri = new Uri(cameraRoot, childPath + (isDirectory ? "/" : string.Empty));
+            DateTime? fileTime = null;
+            if (!isDirectory
+                && DateTime.TryParseExact(
+                    file.Element("TIME")?.Value.Trim(),
+                    "yyyy/MM/dd HH:mm:ss",
+                    CultureInfo.InvariantCulture,
+                    DateTimeStyles.None,
+                    out DateTime parsedFileTime))
+            {
+                fileTime = parsedFileTime;
+            }
+
+            long? sizeBytes = null;
+            if (!isDirectory
+                && long.TryParse(
+                    file.Element("SIZE")?.Value.Trim(),
+                    NumberStyles.None,
+                    CultureInfo.InvariantCulture,
+                    out long parsedSize)
+                && parsedSize >= 0)
+            {
+                sizeBytes = parsedSize;
+            }
+
+            RemoteEntry entry = new RemoteEntry(
+                childName,
+                entryUri,
+                isDirectory,
+                fileTime,
+                isDirectory ? null : filePath,
+                sizeBytes,
+                false);
+            if (entries.TryGetValue(childName, out RemoteEntry? existingEntry))
+            {
+                // Some cameras repeat identical file records; conflicting records remain unsafe.
+                if ((isDirectory && existingEntry.IsDirectory)
+                    || (!isDirectory && !existingEntry.IsDirectory
+                        && fileRecords.TryGetValue(childName, out XElement? existingRecord)
+                        && XNode.DeepEquals(existingRecord, file)))
+                {
+                    continue;
+                }
+
+                throw new IOException("The camera returned duplicate or conflicting file paths.");
+            }
+
+            entries.Add(childName, entry);
+            if (!isDirectory)
+            {
+                fileRecords.Add(childName, file);
+            }
+        }
+
+        // The XML listing can omit photos that are present in the HTML directory listing.
+        foreach (RemoteEntry htmlEntry in GetHtmlEntries(remoteDirectory, cancellationToken))
+        {
+            if (entries.TryGetValue(htmlEntry.Name, out RemoteEntry? xmlEntry))
+            {
+                if (xmlEntry.IsDirectory != htmlEntry.IsDirectory)
+                {
+                    throw new IOException("The camera returned conflicting file and directory listings.");
+                }
+
+                if (!xmlEntry.IsDirectory && !xmlEntry.SizeBytes.HasValue)
+                {
+                    entries[htmlEntry.Name] = xmlEntry with
+                    {
+                        SizeBytes = htmlEntry.SizeBytes,
+                        SizeIsApproximate = htmlEntry.SizeIsApproximate
+                    };
+                }
+
+                continue;
+            }
+
+            string? cameraFilePath = htmlEntry.IsDirectory || cameraFilePathPrefix is null
+                ? null
+                : cameraFilePathPrefix + Uri.UnescapeDataString(
+                    cameraRoot.MakeRelativeUri(htmlEntry.Uri).ToString()).Replace('/', '\\');
+            entries.Add(htmlEntry.Name, htmlEntry with { CameraFilePath = cameraFilePath });
+        }
+
+        return entries.Values
+            .OrderBy(entry => !entry.IsDirectory)
+            .ThenBy(entry => entry.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static List<RemoteEntry> GetHtmlEntries(Uri remoteDirectory, CancellationToken cancellationToken)
     {
         using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, remoteDirectory);
-        using HttpResponseMessage response = HttpClient.Send(request);
+        using HttpResponseMessage response = HttpClient.Send(request, cancellationToken);
         response.EnsureSuccessStatusCode();
-        progress.MarkConnected();
 
         using StreamReader reader = new StreamReader(response.Content.ReadAsStream());
         string html;
         try
         {
-            html = reader.ReadToEnd();
+            html = reader.ReadToEndAsync(cancellationToken).GetAwaiter().GetResult();
         }
-        catch (Exception ex) when (ex is IOException || ex is HttpRequestException || ex is OperationCanceledException)
+        catch (Exception ex) when (!cancellationToken.IsCancellationRequested
+            && (ex is IOException || ex is HttpRequestException || ex is OperationCanceledException))
         {
             throw new DownloadInterruptedException(remoteDirectory, ex);
         }
 
+        if (!Regex.IsMatch(html, "<table\\b[^>]*>", RegexOptions.IgnoreCase)
+            || !Regex.IsMatch(html, "</table\\s*>", RegexOptions.IgnoreCase))
+        {
+            throw new IOException("The camera returned an invalid directory listing.");
+        }
+
         List<RemoteEntry> entries = new List<RemoteEntry>();
-        Regex rowPattern = new Regex("<tr\\b(?<row>.*?)(?=<tr\\b|</table>)", RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        Regex linkPattern = new Regex("<a\\b[^>]*\\bhref\\s*=\\s*[\\\"'](?<href>[^\\\"']+)[\\\"'][^>]*>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        Regex rowPattern = new Regex(
+            "<tr\\b(?<row>.*?)(?=<tr\\b|</table>)",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        Regex linkPattern = new Regex(
+            "<a\\b[^>]*\\bhref\\s*=\\s*[\\\"'](?<href>[^\\\"']+)[\\\"'][^>]*>",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
         Regex fileTimePattern = new Regex("(?<filetime>\\d{4}/\\d{2}/\\d{2}\\s+\\d{2}:\\d{2}:\\d{2})");
+        Regex fileSizePattern = new Regex(
+            "</a>\\s*<td\\b[^>]*>\\s*(?<size>\\d+(?:\\.\\d+)?)\\s*(?<unit>B|KB|MB|GB|TB)\\s*<td\\b",
+            RegexOptions.IgnoreCase | RegexOptions.Singleline);
 
         foreach (Match rowMatch in rowPattern.Matches(html))
         {
+            cancellationToken.ThrowIfCancellationRequested();
             string row = rowMatch.Groups["row"].Value;
             Match linkMatch = linkPattern.Match(row);
             if (!linkMatch.Success)
@@ -798,7 +1618,7 @@ internal static class Program
                 continue;
             }
 
-            string href = System.Net.WebUtility.HtmlDecode(linkMatch.Groups["href"].Value);
+            string href = WebUtility.HtmlDecode(linkMatch.Groups["href"].Value);
             if (!Uri.TryCreate(remoteDirectory, href, out Uri? entryUri)
                 || entryUri is null
                 || !remoteDirectory.IsBaseOf(entryUri)
@@ -815,37 +1635,201 @@ internal static class Program
 
             bool isDirectory = Regex.IsMatch(row, "<i>\\s*folder\\s*</i>", RegexOptions.IgnoreCase);
             DateTime? fileTime = null;
-            if (!isDirectory)
-            {
-                Match fileTimeMatch = fileTimePattern.Match(row);
-                string fileTimeText;
-                if (fileTimeMatch.Success)
-                {
-                    fileTimeText = fileTimeMatch.Groups["filetime"].Value;
-                }
-                else
-                {
-                    fileTimeText = string.Empty;
-                }
-
-                if (!DateTime.TryParseExact(
-                    fileTimeText,
+            Match fileTimeMatch = fileTimePattern.Match(row);
+            if (fileTimeMatch.Success
+                && DateTime.TryParseExact(
+                    fileTimeMatch.Groups["filetime"].Value,
                     "yyyy/MM/dd HH:mm:ss",
                     CultureInfo.InvariantCulture,
                     DateTimeStyles.None,
                     out DateTime parsedFileTime))
-                {
-                    Console.WriteLine($"Skipping {entryUri.AbsolutePath}: invalid filetime '{fileTimeText}'.");
-                    continue;
-                }
-
+            {
                 fileTime = parsedFileTime;
             }
 
-            entries.Add(new RemoteEntry(name, entryUri, isDirectory, fileTime));
+            long? sizeBytes = null;
+            Match fileSizeMatch = fileSizePattern.Match(row);
+            if (!isDirectory && fileSizeMatch.Success
+                && decimal.TryParse(
+                    fileSizeMatch.Groups["size"].Value,
+                    NumberStyles.AllowDecimalPoint,
+                    CultureInfo.InvariantCulture,
+                    out decimal size))
+            {
+                decimal multiplier = fileSizeMatch.Groups["unit"].Value.ToUpperInvariant() switch
+                {
+                    "KB" => 1024m,
+                    "MB" => 1024m * 1024,
+                    "GB" => 1024m * 1024 * 1024,
+                    "TB" => 1024m * 1024 * 1024 * 1024,
+                    _ => 1m
+                };
+                if (size <= long.MaxValue / multiplier)
+                {
+                    sizeBytes = (long)decimal.Round(size * multiplier);
+                }
+            }
+
+            entries.Add(new RemoteEntry(name, entryUri, isDirectory, fileTime, null, sizeBytes, sizeBytes.HasValue));
         }
 
         return entries;
+    }
+
+    private static string? GetCameraFilePathPrefix(string filePath)
+    {
+        string[] pathSegments = filePath.Replace('/', '\\').Split('\\');
+        int dcimIndex = Array.FindIndex(pathSegments, segment =>
+            string.Equals(segment, "DCIM", StringComparison.OrdinalIgnoreCase));
+        if (dcimIndex < 0)
+        {
+            return null;
+        }
+
+        return string.Join("\\", pathSegments.Take(dcimIndex + 1)) + "\\";
+    }
+
+    private static string[] GetCameraRelativeFileSegments(string filePath)
+    {
+        string[] pathSegments = filePath.Replace('\\', '/').Split('/');
+        int dcimIndex = Array.FindIndex(pathSegments, segment =>
+            string.Equals(segment, "DCIM", StringComparison.OrdinalIgnoreCase));
+        if (dcimIndex < 0 || dcimIndex == pathSegments.Length - 1)
+        {
+            throw new IOException("The camera returned a file path outside the DCIM folder.");
+        }
+
+        string[] relativeSegments = pathSegments.Skip(dcimIndex + 1).ToArray();
+        if (relativeSegments.Any(segment =>
+            segment.Length == 0
+            || segment is "." or ".."
+            || segment.Any(char.IsControl)))
+        {
+            throw new IOException("The camera returned an invalid file path.");
+        }
+
+        return relativeSegments;
+    }
+
+    private static async Task<(string? Error, bool TransportFailure)> SendCameraDeleteRequest(
+        string ipAddress,
+        string path,
+        Uri fileUri,
+        string cameraFilePath)
+    {
+        UriBuilder deleteUri = new UriBuilder(fileUri)
+        {
+            Path = "/",
+            Query = $"custom=1&cmd=4003&str={Uri.EscapeDataString(cameraFilePath)}"
+        };
+        try
+        {
+            using HttpRequestMessage deleteRequest = new HttpRequestMessage(HttpMethod.Get, deleteUri.Uri);
+            using HttpResponseMessage response = CameraDeleteHttpClient.Send(deleteRequest);
+            if (!response.IsSuccessStatusCode)
+            {
+                return ($"The camera rejected the delete request ({(int)response.StatusCode}).", false);
+            }
+
+            string responseXml = await response.Content.ReadAsStringAsync();
+            if (!HasSuccessfulCameraDeleteStatus(responseXml))
+            {
+                return ("The camera did not confirm deletion with <Status>0</Status>.", false);
+            }
+
+            return (null, false);
+        }
+        catch (Exception ex) when (IsDownloadException(ex))
+        {
+            Console.Error.WriteLine($"Camera delete request for {path} from {ipAddress} failed: {ex.Message}");
+            return ($"The delete request failed: {ex.Message}", ex is HttpRequestException || ex is OperationCanceledException);
+        }
+    }
+
+    private static bool HasSuccessfulCameraDeleteStatus(string xml)
+    {
+        XDocument response;
+        try
+        {
+            using StringReader stringReader = new StringReader(xml);
+            using XmlReader xmlReader = XmlReader.Create(stringReader, new XmlReaderSettings
+            {
+                DtdProcessing = DtdProcessing.Prohibit,
+                XmlResolver = null
+            });
+            response = XDocument.Load(xmlReader);
+        }
+        catch (XmlException ex)
+        {
+            throw new IOException("The camera returned an invalid XML delete response.", ex);
+        }
+
+        XElement? status = response.Root?.Name.LocalName == "Status"
+            ? response.Root
+            : response.Descendants().FirstOrDefault(element => element.Name.LocalName == "Status");
+        return status?.Value.Trim() == "0";
+    }
+
+    private static bool TryResolveCameraPath(
+        string ipAddress,
+        string relativePath,
+        bool isDirectory,
+        out Uri? resolvedUri)
+    {
+        resolvedUri = null;
+        if (relativePath.StartsWith('/') || relativePath.Contains('\\')
+            || (!isDirectory && relativePath.EndsWith('/')))
+        {
+            return false;
+        }
+
+        string[] segments = relativePath.Length == 0 ? Array.Empty<string>() : relativePath.Split('/');
+        if (segments.Any(segment =>
+        {
+            if (segment.Length == 0)
+            {
+                return true;
+            }
+
+            string decodedSegment = segment;
+            for (int decodePass = 0; decodePass < 3; decodePass++)
+            {
+                decodedSegment = Uri.UnescapeDataString(decodedSegment);
+                if (decodedSegment is "." or ".."
+                    || decodedSegment.Contains('/')
+                    || decodedSegment.Contains('\\')
+                    || decodedSegment.Any(char.IsControl))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }))
+        {
+            return false;
+        }
+
+        if (!isDirectory && segments.Length == 0)
+        {
+            return false;
+        }
+
+        Uri cameraRoot = new Uri($"http://{ipAddress}/DCIM/");
+        string encodedPath = string.Join('/', segments.Select(Uri.EscapeDataString));
+        if (isDirectory && encodedPath.Length > 0)
+        {
+            encodedPath += "/";
+        }
+
+        Uri candidate = new Uri(cameraRoot, encodedPath);
+        if (!cameraRoot.IsBaseOf(candidate) || candidate.Query.Length > 0)
+        {
+            return false;
+        }
+
+        resolvedUri = candidate;
+        return true;
     }
 
     private static bool IsDownloadException(Exception exception)
@@ -878,12 +1862,16 @@ internal static class Program
         string cameraName,
         Uri uri,
         Exception exception,
-        CameraProgress progress)
+        CameraProgress progress,
+        CancellationToken cancellationToken)
     {
         progress.MarkRetrying(exception.Message);
         Console.Error.WriteLine(
-            $"Connection interrupted for {cameraName} at {uri.AbsolutePath}: {exception.Message} Retrying in 5 minutes.");
-        Thread.Sleep(RetryDelay);
+            $"Connection interrupted for {cameraName} at {uri.AbsolutePath}: {exception.Message} Retrying in 10 seconds.");
+        if (cancellationToken.WaitHandle.WaitOne(RetryDelay))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+        }
     }
 
     private static void PrintDownloadFailure(string cameraName, Uri uri, Exception exception)
@@ -891,7 +1879,76 @@ internal static class Program
         Console.WriteLine($"Unable to process {uri.AbsolutePath} for {cameraName}: {exception.Message}");
     }
 
-    private sealed record RemoteEntry(string Name, Uri Uri, bool IsDirectory, DateTime? FileTime);
+    private sealed class CameraScanCoordinator
+    {
+        private readonly object syncRoot = new object();
+        private readonly SemaphoreSlim scanLock = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim pauseLock = new SemaphoreSlim(1, 1);
+        private CancellationTokenSource? activeScan;
+        private bool pauseRequested;
+
+        public CancellationTokenSource? BeginScan()
+        {
+            scanLock.Wait();
+            lock (syncRoot)
+            {
+                if (pauseRequested)
+                {
+                    scanLock.Release();
+                    return null;
+                }
+
+                activeScan = new CancellationTokenSource();
+                return activeScan;
+            }
+        }
+
+        public void EndScan(CancellationTokenSource scan)
+        {
+            lock (syncRoot)
+            {
+                if (activeScan == scan)
+                {
+                    activeScan = null;
+                }
+            }
+
+            scanLock.Release();
+        }
+
+        public async Task PauseScanAsync()
+        {
+            // Serialize pause requests and wait for the cancelled scan to release the camera.
+            await pauseLock.WaitAsync();
+            lock (syncRoot)
+            {
+                pauseRequested = true;
+                activeScan?.Cancel();
+            }
+
+            await scanLock.WaitAsync();
+        }
+
+        public void ResumeScan()
+        {
+            lock (syncRoot)
+            {
+                pauseRequested = false;
+            }
+
+            scanLock.Release();
+            pauseLock.Release();
+        }
+    }
+
+    private sealed record RemoteEntry(
+        string Name,
+        Uri Uri,
+        bool IsDirectory,
+        DateTime? FileTime,
+        string? CameraFilePath,
+        long? SizeBytes,
+        bool SizeIsApproximate);
 
     private sealed record DownloadCandidate(Uri FileUri, string DestinationPath, DateTime FileTime);
 
@@ -904,7 +1961,32 @@ internal static class Program
         double AggregateBytesPerSecond,
         double OverallProgressPercent,
         int ScanningCameras,
-        IReadOnlyList<CameraSnapshot> Cameras);
+        IReadOnlyList<CameraSnapshot> Cameras,
+        string Version,
+        string BuildTimeUtc);
+
+    private sealed record CameraSizeLimitRequest(decimal MaxSizeGb);
+
+    private sealed record CameraSizeLimitResponse(decimal MaxSizeGb, IReadOnlyList<string> DeletedPaths, bool LimitStillExceeded);
+
+    private sealed record CameraFileEntry(
+        string Name,
+        string Path,
+        bool IsDirectory,
+        DateTime? FileTime,
+        long? SizeBytes,
+        bool SizeIsApproximate,
+        string? DownloadStatus);
+
+    private sealed record CameraFileDeleteRequest(string Path, bool Confirmed);
+
+    private sealed record CameraFileDeleteResponse(string DeletedPath);
+
+    private sealed record CameraFileBatchDeleteRequest(string[]? Paths, bool Confirmed);
+
+    private sealed record CameraFileBatchDeleteResult(string Path, bool Deleted, string? Error);
+
+    private sealed record CameraFileBatchDeleteResponse(IReadOnlyList<CameraFileBatchDeleteResult> Results);
 
     private sealed class DownloadInterruptedException : IOException
     {

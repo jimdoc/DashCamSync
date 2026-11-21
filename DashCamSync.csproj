@@ -8,6 +8,16 @@
 
     <RuntimeIdentifiers>osx-arm64;linux-x64;linux-arm64</RuntimeIdentifiers>
     <SelfContained>true</SelfContained>
+    <VersionPrefix>1.0</VersionPrefix>
+    <BuildStampUtc>$([System.DateTime]::UtcNow.ToString("yyMMdd.HHmmss"))</BuildStampUtc>
+    <InformationalVersion>$(VersionPrefix).$(BuildStampUtc)</InformationalVersion>
   </PropertyGroup>
+
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Reflection.AssemblyMetadataAttribute">
+      <_Parameter1>BuildTimestampUtc</_Parameter1>
+      <_Parameter2>$([System.DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ"))</_Parameter2>
+    </AssemblyAttribute>
+  </ItemGroup>
 
 </Project>

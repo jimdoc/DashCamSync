@@ -106,7 +106,8 @@ input {
 }
 
 .live-dot.is-offline,
-.connection-error .state-dot {
+.connection-error .state-dot,
+.connection-disconnected .state-dot {
   background: #ea7669;
 }
 
@@ -244,7 +245,6 @@ h2 {
   display: block;
   background: var(--teal);
   border-radius: inherit;
-  transition: width 300ms ease;
 }
 
 .camera-section {
@@ -294,7 +294,6 @@ h2 {
   border-left: 3px solid var(--teal);
   border-radius: 6px;
   box-shadow: var(--shadow);
-  animation: appear 320ms ease both;
 }
 
 .camera-card.has-error {
@@ -331,6 +330,163 @@ h2 {
   font-size: 11px;
 }
 
+.camera-ip:hover {
+  color: var(--teal);
+}
+
+.camera-files-button,
+.camera-rescan-button,
+.file-browser-close,
+.file-browser-up {
+  padding: 6px 9px;
+  color: var(--teal);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.camera-files-button:disabled,
+.camera-rescan-button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.camera-file-browser {
+  margin: 0 0 18px;
+  padding: 14px;
+  background: #f8faf9;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+}
+
+.file-browser-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.file-browser-path {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+}
+
+.file-browser-message,
+.rescan-message,
+.file-delete-status {
+  margin: 8px 0;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.file-delete-status.success {
+  color: #17654d;
+}
+
+.file-delete-status.failure {
+  color: #9b3936;
+}
+
+.file-browser-list {
+  display: grid;
+}
+
+.file-browser-actions:not([hidden]) {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 8px 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.file-browser-actions label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.file-browser-row {
+  min-height: 36px;
+  padding: 6px 0;
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto auto auto;
+  align-items: center;
+  gap: 12px;
+  border-top: 1px solid #e8eeeb;
+}
+
+.file-browser-select {
+  width: 14px;
+  margin: 0;
+}
+
+.file-browser-entry {
+  min-width: 0;
+  padding: 0;
+  color: var(--ink);
+  background: none;
+  border: 0;
+  text-align: left;
+  overflow-wrap: anywhere;
+  font: inherit;
+  font-size: 11px;
+}
+
+button.file-browser-entry {
+  color: var(--teal);
+  cursor: pointer;
+}
+
+.file-browser-download-status {
+  display: inline-block;
+  margin-left: 8px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.file-browser-download-status.downloaded {
+  color: #17654d;
+}
+
+.file-browser-date,
+.file-browser-size {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.file-browser-row .file-browser-date {
+  grid-column: 4;
+}
+
+.file-browser-row .file-browser-delete {
+  grid-column: 5;
+}
+
+.file-browser-delete {
+  padding: 5px 8px;
+  color: #9b3936;
+  background: var(--red-soft);
+  border: 1px solid #f0d1cd;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.file-browser-delete:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
 .state-group {
   display: flex;
   align-items: center;
@@ -356,13 +512,16 @@ h2 {
 }
 
 .connection-retrying,
-.transfer-waiting-to-retry {
+.transfer-waiting-to-retry,
+.transfer-paused-for-deletion {
   color: #82520e;
   background: var(--amber-soft);
 }
 
 .connection-error,
-.transfer-error {
+.connection-disconnected,
+.transfer-error,
+.transfer-connection-lost {
   color: #9b3936;
   background: var(--red-soft);
 }
@@ -382,6 +541,7 @@ h2 {
 
 .camera-metrics {
   margin: 20px 0 17px;
+  flex-wrap: wrap;
   gap: 0;
   border-top: 1px solid #edf1ef;
   border-bottom: 1px solid #edf1ef;
@@ -409,6 +569,71 @@ h2 {
   font-size: 14px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
+}
+
+.statistics-note {
+  margin: -8px 0 17px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.size-limit-form {
+  margin: 0 0 15px;
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 9px;
+}
+
+.size-limit-field {
+  display: grid;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 600;
+}
+
+.size-limit-input {
+  width: 150px;
+  min-height: 34px;
+  padding: 6px 9px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.size-limit-button {
+  min-height: 34px;
+  padding: 6px 12px;
+  color: #fff;
+  background: var(--teal);
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.size-limit-button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+
+.size-limit-message {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+.storage-status {
+  margin: -7px 0 15px;
+  color: var(--orange);
+  font-size: 11px;
+  font-weight: 650;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .current-file {
@@ -447,7 +672,6 @@ h2 {
   display: block;
   background: var(--orange);
   border-radius: inherit;
-  transition: width 240ms linear;
 }
 
 .overall-line {
@@ -488,11 +712,6 @@ h2 {
 
 .footer-message {
   color: var(--red);
-}
-
-@keyframes appear {
-  from { opacity: 0; transform: translateY(4px); }
-  to { opacity: 1; transform: translateY(0); }
 }
 
 @media (max-width: 760px) {
@@ -546,6 +765,25 @@ h2 {
 
   .state-group {
     flex-wrap: wrap;
+  }
+
+  .file-browser-row {
+    grid-template-columns: 14px minmax(0, 1fr) auto;
+  }
+
+  .file-browser-row .file-browser-entry,
+  .file-browser-row .file-browser-date {
+    grid-column: 2;
+  }
+
+  .file-browser-row .file-browser-date,
+  .file-browser-row .file-browser-delete {
+    grid-row: 2;
+  }
+
+  .file-browser-row .file-browser-size,
+  .file-browser-row .file-browser-delete {
+    grid-column: 3;
   }
 
   .camera-metric {
