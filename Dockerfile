@@ -26,7 +26,7 @@ FROM mcr.microsoft.com/dotnet/runtime-deps:8.0
 WORKDIR /app
 COPY --from=build /app/publish ./
 
-ENV DASHCAM_DASHBOARD_URL=http://+:8081 \
+ENV DASHCAM_PORT=8081 \
     DASHCAM_DOWNLOAD_ROOT=/volume1/Data/DashCam \
     DASHCAM_REQUIRE_CAMERA_SETTINGS=true \
     DASHCAM_CAMERA_1_IP=ENTER_CAMERA_1_IP \

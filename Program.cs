@@ -139,7 +139,25 @@ internal static class Program
         string? configuredDashboardUrl = Environment.GetEnvironmentVariable("DASHCAM_DASHBOARD_URL");
         if (string.IsNullOrWhiteSpace(configuredDashboardUrl))
         {
-            configuredDashboardUrl = "http://127.0.0.1:8081";
+            string? configuredPort = Environment.GetEnvironmentVariable("DASHCAM_PORT");
+            if (string.IsNullOrWhiteSpace(configuredPort))
+            {
+                configuredDashboardUrl = "http://127.0.0.1:8081";
+            }
+            else if (!int.TryParse(
+                configuredPort,
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out int port)
+                || port is < 1 or > 65535)
+            {
+                Console.Error.WriteLine("DASHCAM_PORT must be an integer between 1 and 65535.");
+                return;
+            }
+            else
+            {
+                configuredDashboardUrl = $"http://+:{port.ToString(CultureInfo.InvariantCulture)}";
+            }
         }
 
         builder.WebHost.UseUrls(configuredDashboardUrl);
@@ -214,15 +232,7 @@ internal static class Program
         });
         void QueueCameraScan(string ipAddress)
         {
-            string cameraName = cameras[ipAddress];
-            _ = Task.Run(() => ScanCamera(
-                new Uri($"http://{ipAddress}/DCIM/"),
-                Path.Combine(destinationRoot, cameraName),
-                cameraName,
-                cameraProgress[ipAddress],
-                cameraScans[ipAddress],
-                sizeLimitStore,
-                sizeLimitLocks[ipAddress]));
+            cameraScans[ipAddress].RequestScan();
         }
 
         app.MapPost("/api/cameras/{ipAddress}/scan", async (string ipAddress) =>
@@ -687,14 +697,32 @@ internal static class Program
     {
         Uri remoteRoot = new Uri($"http://{ipAddress}/DCIM/");
         string localRoot = Path.Combine(destinationRoot, cameraName);
-        progress.Reconnected += () => Task.Run(() => ScanCamera(
-            remoteRoot, localRoot, cameraName, progress, scanCoordinator, sizeLimitStore, sizeLimitLock));
+        progress.Reconnected += scanCoordinator.RequestScan;
         // The monitor keeps running after downloads finish so the dashboard reflects live connectivity.
         Task.Run(() => MonitorCameraConnection(remoteRoot, progress, CancellationToken.None));
-        ScanCamera(remoteRoot, localRoot, cameraName, progress, scanCoordinator, sizeLimitStore, sizeLimitLock);
+        _ = Task.Run(async () =>
+        {
+            while (true)
+            {
+                int downloadedFileCount = ScanCamera(
+                    remoteRoot,
+                    localRoot,
+                    cameraName,
+                    progress,
+                    scanCoordinator,
+                    sizeLimitStore,
+                    sizeLimitLock);
+                if (downloadedFileCount > 0)
+                {
+                    continue;
+                }
+
+                await scanCoordinator.WaitForScanRequestAsync(TimeSpan.FromHours(1));
+            }
+        });
     }
 
-    private static void ScanCamera(
+    private static int ScanCamera(
         Uri remoteRoot,
         string localRoot,
         string cameraName,
@@ -706,10 +734,11 @@ internal static class Program
         using CancellationTokenSource? scanCancellation = scanCoordinator.BeginScan();
         if (scanCancellation is null)
         {
-            return;
+            return 0;
         }
 
         CancellationToken cancellationToken = scanCancellation.Token;
+        int completedFileCount = 0;
         try
         {
             cancellationToken.ThrowIfCancellationRequested();
@@ -771,6 +800,7 @@ internal static class Program
                         cancellationToken);
                     if (completedLength.HasValue)
                     {
+                        completedFileCount++;
                         progress.CompleteFile(
                             completedLength.Value,
                             measuredFiles.Contains(download.FileUri.AbsoluteUri));
@@ -786,15 +816,18 @@ internal static class Program
             cancellationToken.ThrowIfCancellationRequested();
             progress.Finish();
             Console.WriteLine($"Files for {cameraName} are stored in: {localRoot}");
+            return completedFileCount;
         }
         catch (Exception ex) when (IsDownloadException(ex) && cancellationToken.IsCancellationRequested)
         {
             Console.WriteLine($"Interrupted the scan for {cameraName}; it will be restarted.");
+            return 0;
         }
         catch (Exception ex) when (IsDownloadException(ex))
         {
             progress.MarkError(ex.Message);
             PrintDownloadFailure(cameraName, remoteRoot, ex);
+            return 0;
         }
         finally
         {
@@ -1884,6 +1917,7 @@ internal static class Program
         private readonly object syncRoot = new object();
         private readonly SemaphoreSlim scanLock = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim pauseLock = new SemaphoreSlim(1, 1);
+        private readonly SemaphoreSlim scanRequestSignal = new SemaphoreSlim(0, 1);
         private CancellationTokenSource? activeScan;
         private bool pauseRequested;
 
@@ -1938,6 +1972,22 @@ internal static class Program
 
             scanLock.Release();
             pauseLock.Release();
+        }
+
+        public void RequestScan()
+        {
+            lock (syncRoot)
+            {
+                if (scanRequestSignal.CurrentCount == 0)
+                {
+                    scanRequestSignal.Release();
+                }
+            }
+        }
+
+        public Task<bool> WaitForScanRequestAsync(TimeSpan timeout)
+        {
+            return scanRequestSignal.WaitAsync(timeout);
         }
     }
 

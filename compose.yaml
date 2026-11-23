@@ -4,7 +4,7 @@ services:
       context: .
     network_mode: host
     environment:
-      DASHCAM_DASHBOARD_URL: http://+:8081
+      DASHCAM_PORT: ${DASHCAM_PORT:-8081}
       DASHCAM_DOWNLOAD_ROOT: /volume1/Data/DashCam
       DASHCAM_REQUIRE_CAMERA_SETTINGS: "true"
       DASHCAM_CAMERA_1_IP: ${DASHCAM_CAMERA_1_IP:-192.168.1.58}
