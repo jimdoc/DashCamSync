@@ -29,6 +29,8 @@ Set `DASHCAM_PORT` to the available port you want the dashboard to use; it defau
 
 To add another camera, add `DASHCAM_CAMERA_3_IP` and `DASHCAM_CAMERA_3_NAME`, then continue with the next number for additional cameras. The program exits with an error if a configured pair is incomplete or still contains a placeholder.
 
+IP address should be statically assigned so they do not change. A local DNS name may also work, but I have not tested this.
+
 For persistent downloads, add a volume mapping with the NAS folder on the left and `/volume1/Data/DashCam` on the right. Set `DASHCAM_DOWNLOAD_ROOT` to `/volume1/Data/DashCam`:
 
 ```text
