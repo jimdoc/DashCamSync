@@ -1,7 +1,7 @@
 # DashCamSync
 I created this project to automatically copy videos from my 2 Viofo dashcams to my NAS.
 
-**NEVER** expose this web interface to the internet. This is designed to be accessed via an unencrypted local connection only. User authentication is not part of this project at this time.
+**NEVER** expose this web interface to the internet. This is designed to be accessed via an unencrypted local connection only. User authentication is not part of this project at this time. Authentication may be a future addition. Encryption could be done via reverse proxy but for now is out of scope for this project.
 
 To make this work, the dash cams must be set to "station mode". Please contact Viofo customer support for special firmware for your dashcam that allows it to remain in station mode.
 
