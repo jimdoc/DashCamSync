@@ -50,6 +50,8 @@ internal static class Program
 
     private static readonly string BuildTimeUtc = GetBuildTimeUtc();
 
+    /// <summary>Reads the assembly's informational version, shortening its revision suffix.</summary>
+    /// <returns>The version string, or "unknown" if it is unavailable.</returns>
     private static string GetBuildVersion()
     {
         System.Reflection.Assembly assembly = typeof(Program).Assembly;
@@ -70,6 +72,8 @@ internal static class Program
         return version;
     }
 
+    /// <summary>Reads the UTC build timestamp from assembly metadata.</summary>
+    /// <returns>The build timestamp, or "unknown" if it is unavailable.</returns>
     private static string GetBuildTimeUtc()
     {
         System.Reflection.Assembly assembly = typeof(Program).Assembly;
@@ -85,6 +89,7 @@ internal static class Program
         return "unknown";
     }
 
+    /// <summary>Loads configuration, starts camera workers, and hosts the dashboard and its API.</summary>
     public static void Main()
     {
         string? configuredRoot = Environment.GetEnvironmentVariable("DASHCAM_DOWNLOAD_ROOT");
@@ -230,6 +235,8 @@ internal static class Program
                 BuildVersion,
                 BuildTimeUtc));
         });
+        /// <summary>Signals the camera worker to perform a scan.</summary>
+        /// <param name="ipAddress">The configured camera's IP address.</param>
         void QueueCameraScan(string ipAddress)
         {
             cameraScans[ipAddress].RequestScan();
@@ -602,6 +609,8 @@ internal static class Program
         }
     }
 
+    /// <summary>Loads and validates camera IP addresses and names from the environment and defaults.</summary>
+    /// <returns>A mapping of camera IP addresses to names.</returns>
     private static Dictionary<string, string> GetCameras()
     {
         Dictionary<string, string> cameras = new Dictionary<string, string>()
@@ -686,6 +695,14 @@ internal static class Program
         return cameras;
     }
 
+    /// <summary>Starts connection monitoring and the recurring scan worker for a camera.</summary>
+    /// <param name="ipAddress">The camera's IP address.</param>
+    /// <param name="cameraName">The camera's display name and download folder name.</param>
+    /// <param name="destinationRoot">The root directory for all camera downloads.</param>
+    /// <param name="progress">The camera's shared connection and transfer state.</param>
+    /// <param name="sizeLimitStore">The configured per-camera storage limits.</param>
+    /// <param name="sizeLimitLock">The lock protecting this camera's storage cleanup.</param>
+    /// <param name="scanCoordinator">The coordinator for scan requests and interruptions.</param>
     private static void DownloadCamera(
         string ipAddress,
         string cameraName,
@@ -722,6 +739,15 @@ internal static class Program
         });
     }
 
+    /// <summary>Scans a camera, downloads its missing files, and updates transfer state.</summary>
+    /// <param name="remoteRoot">The camera's DCIM root URI.</param>
+    /// <param name="localRoot">The local download directory for the camera.</param>
+    /// <param name="cameraName">The camera's display name for logging.</param>
+    /// <param name="progress">The camera's shared connection and transfer state.</param>
+    /// <param name="scanCoordinator">The coordinator that serializes and cancels scans.</param>
+    /// <param name="sizeLimitStore">The configured per-camera storage limits.</param>
+    /// <param name="sizeLimitLock">The lock protecting this camera's storage cleanup.</param>
+    /// <returns>The number of newly completed files, or zero if the scan did not complete.</returns>
     private static int ScanCamera(
         Uri remoteRoot,
         string localRoot,
@@ -835,6 +861,12 @@ internal static class Program
         }
     }
 
+    /// <summary>Probes pending files for their sizes and updates the queue's byte totals.</summary>
+    /// <param name="downloads">The ordered candidates discovered on the camera.</param>
+    /// <param name="downloadedFiles">The manifest of previously downloaded file URIs.</param>
+    /// <param name="progress">The state to update with measured queue bytes.</param>
+    /// <param name="cancellationToken">Cancels the measurement when the scan is interrupted.</param>
+    /// <returns>The URIs whose sizes were successfully measured.</returns>
     private static HashSet<string> MeasureQueueBytes(
         List<DownloadCandidate> downloads,
         Dictionary<string, DateTime> downloadedFiles,
@@ -881,6 +913,10 @@ internal static class Program
         return measuredFiles;
     }
 
+    /// <summary>Requests a remote file's content length using HTTP HEAD.</summary>
+    /// <param name="fileUri">The camera file to probe.</param>
+    /// <param name="cancellationToken">Cancels the probe.</param>
+    /// <returns>The reported byte length, or null if it could not be determined.</returns>
     private static long? GetRemoteLength(Uri fileUri, CancellationToken cancellationToken)
     {
         try
@@ -902,6 +938,10 @@ internal static class Program
         }
     }
 
+    /// <summary>Periodically probes the camera and reports connection changes.</summary>
+    /// <param name="remoteRoot">The camera's DCIM root URI.</param>
+    /// <param name="progress">The state to update with connectivity results.</param>
+    /// <param name="cancellationToken">Stops the monitor.</param>
     private static void MonitorCameraConnection(Uri remoteRoot, CameraProgress progress, CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -931,6 +971,9 @@ internal static class Program
         }
     }
 
+    /// <summary>Removes GUID-named temporary files left in the camera's download tree.</summary>
+    /// <param name="localRoot">The local camera directory to search.</param>
+    /// <param name="cameraName">The camera's display name for logging.</param>
     private static void CleanUpTemporaryFiles(string localRoot, string cameraName)
     {
         if (!Directory.Exists(localRoot))
@@ -956,6 +999,13 @@ internal static class Program
         }
     }
 
+    /// <summary>Recursively collects timestamped camera files and their local destinations.</summary>
+    /// <param name="remoteDirectory">The camera directory to enumerate.</param>
+    /// <param name="localDirectory">The corresponding local directory.</param>
+    /// <param name="cameraName">The camera's display name for logging.</param>
+    /// <param name="downloads">The list to which discovered candidates are added.</param>
+    /// <param name="progress">The state to update for connection errors and retries.</param>
+    /// <param name="cancellationToken">Cancels directory traversal.</param>
     private static void CollectDownloads(
         Uri remoteDirectory,
         string localDirectory,
@@ -996,6 +1046,19 @@ internal static class Program
         }
     }
 
+    /// <summary>Downloads or resumes a missing file, records it, and enforces the storage limit.</summary>
+    /// <param name="fileUri">The camera file's URI.</param>
+    /// <param name="destinationPath">The path for the completed local file.</param>
+    /// <param name="localRoot">The local camera directory subject to cleanup.</param>
+    /// <param name="cameraName">The camera's display name for logging.</param>
+    /// <param name="fileTime">The camera timestamp to apply to the local file.</param>
+    /// <param name="downloadedFiles">The in-memory manifest of previously downloaded URIs.</param>
+    /// <param name="manifestPath">The path where download records are persisted.</param>
+    /// <param name="progress">The state to update during the transfer and cleanup.</param>
+    /// <param name="sizeLimitStore">The configured per-camera storage limits.</param>
+    /// <param name="sizeLimitLock">The lock protecting this camera's storage cleanup.</param>
+    /// <param name="cancellationToken">Cancels the download or its retries.</param>
+    /// <returns>The completed file's byte length, or null if it was already downloaded.</returns>
     private static long? DownloadFile(
         Uri fileUri,
         string destinationPath,
@@ -1083,11 +1146,21 @@ internal static class Program
         return completedLength;
     }
 
+    /// <summary>Builds a local file path under its timestamp-based date directory.</summary>
+    /// <param name="localDirectory">The local directory corresponding to the camera directory.</param>
+    /// <param name="fileName">The camera file's name.</param>
+    /// <param name="fileTime">The camera timestamp used to select the date directory.</param>
+    /// <returns>The expected local file path.</returns>
     private static string GetDownloadDestinationPath(string localDirectory, string fileName, DateTime fileTime)
     {
         return Path.Combine(localDirectory, fileTime.ToString("yyyyMMdd", CultureInfo.InvariantCulture), fileName);
     }
 
+    /// <summary>Determines a camera file's download status from the local disk and manifest.</summary>
+    /// <param name="entry">The camera file listing entry.</param>
+    /// <param name="localDirectory">The corresponding local directory.</param>
+    /// <param name="downloadedFiles">The manifest of previously downloaded file URIs.</param>
+    /// <returns>The status identifier used by the file browser.</returns>
     private static string GetDownloadStatus(
         RemoteEntry entry,
         string localDirectory,
@@ -1107,11 +1180,20 @@ internal static class Program
         return entry.FileTime.HasValue ? "notDownloaded" : "unknown";
     }
 
+    /// <summary>Loads the download manifest and persists any migration or expiration changes.</summary>
+    /// <param name="manifestPath">The path to the camera's manifest.</param>
+    /// <param name="cameraName">The camera's display name for logging.</param>
+    /// <returns>A mapping of file URIs to UTC download times.</returns>
     private static Dictionary<string, DateTime> LoadDownloadedFiles(string manifestPath, string cameraName)
     {
         return ReadDownloadedFiles(manifestPath, cameraName, rewrite: true);
     }
 
+    /// <summary>Reads a manifest, migrates legacy entries in memory, and excludes expired records.</summary>
+    /// <param name="manifestPath">The path to the camera's manifest.</param>
+    /// <param name="cameraName">The camera's display name for logging.</param>
+    /// <param name="rewrite">Whether to persist migration and expiration changes.</param>
+    /// <returns>A mapping of file URIs to UTC download times.</returns>
     private static Dictionary<string, DateTime> ReadDownloadedFiles(string manifestPath, string cameraName, bool rewrite)
     {
         if (!File.Exists(manifestPath))
@@ -1205,6 +1287,10 @@ internal static class Program
         return downloadedFiles;
     }
 
+    /// <summary>Persists a new download record and adds it to the in-memory manifest.</summary>
+    /// <param name="downloadKey">The absolute URI identifying the camera file.</param>
+    /// <param name="downloadedFiles">The in-memory manifest to update after persistence.</param>
+    /// <param name="manifestPath">The path to the camera's manifest.</param>
     private static void SaveDownloadedFile(
         string downloadKey,
         Dictionary<string, DateTime> downloadedFiles,
@@ -1223,6 +1309,9 @@ internal static class Program
         downloadedFiles[downloadKey] = updatedFiles[downloadKey];
     }
 
+    /// <summary>Writes download records in URI order using a temporary manifest file.</summary>
+    /// <param name="manifestPath">The destination manifest path.</param>
+    /// <param name="downloadedFiles">The file URI and UTC timestamp records to write.</param>
     private static void WriteDownloadedFiles(string manifestPath, Dictionary<string, DateTime> downloadedFiles)
     {
         Dictionary<string, DateTime> orderedFiles = new Dictionary<string, DateTime>(StringComparer.Ordinal);
@@ -1248,6 +1337,12 @@ internal static class Program
         }
     }
 
+    /// <summary>Downloads a camera file to a partial file, resuming when the server supports ranges.</summary>
+    /// <param name="fileUri">The camera file's URI.</param>
+    /// <param name="partialPath">The path of the incomplete local file.</param>
+    /// <param name="cameraName">The camera's display name for logging.</param>
+    /// <param name="progress">The state to update during the transfer.</param>
+    /// <param name="cancellationToken">Cancels the request or transfer.</param>
     private static void DownloadToPartialFile(
         Uri fileUri,
         string partialPath,
@@ -1329,6 +1424,14 @@ internal static class Program
         }
     }
 
+    /// <summary>Copies response bytes to a file while reporting progress and enforcing read timeouts.</summary>
+    /// <param name="source">The camera's response stream.</param>
+    /// <param name="destination">The local stream receiving the bytes.</param>
+    /// <param name="fileUri">The camera file's URI for errors and logging.</param>
+    /// <param name="cameraName">The camera's display name for logging.</param>
+    /// <param name="totalLength">The expected total file length, if known.</param>
+    /// <param name="progress">The state to update with transfer progress.</param>
+    /// <param name="cancellationToken">Cancels the copy.</param>
     private static void CopyResponseToFile(
         Stream source,
         Stream destination,
@@ -1400,6 +1503,12 @@ internal static class Program
         }
     }
 
+    /// <summary>Lists a camera directory, retrying transient failures until cancelled.</summary>
+    /// <param name="remoteDirectory">The camera directory to list.</param>
+    /// <param name="cameraName">The camera's display name for retry logging.</param>
+    /// <param name="progress">The state to update for connection and retry events.</param>
+    /// <param name="cancellationToken">Cancels the listing or retry wait.</param>
+    /// <returns>The directory's immediate entries.</returns>
     private static List<RemoteEntry> GetEntriesWithRetry(
         Uri remoteDirectory,
         string cameraName,
@@ -1420,6 +1529,11 @@ internal static class Program
         }
     }
 
+    /// <summary>Combines the camera's XML and HTML listings into validated immediate directory entries.</summary>
+    /// <param name="remoteDirectory">The camera directory under DCIM to list.</param>
+    /// <param name="progress">Optional state to mark connected after a successful request.</param>
+    /// <param name="cancellationToken">Cancels the listing requests and parsing.</param>
+    /// <returns>The directory's entries, with directories first.</returns>
     private static List<RemoteEntry> GetEntries(
         Uri remoteDirectory,
         CameraProgress? progress = null,
@@ -1605,6 +1719,10 @@ internal static class Program
             .ToList();
     }
 
+    /// <summary>Parses immediate files and directories from the camera's HTML directory listing.</summary>
+    /// <param name="remoteDirectory">The camera directory to list.</param>
+    /// <param name="cancellationToken">Cancels the request and parsing.</param>
+    /// <returns>The parsed entries, including approximate sizes when available.</returns>
     private static List<RemoteEntry> GetHtmlEntries(Uri remoteDirectory, CancellationToken cancellationToken)
     {
         using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, remoteDirectory);
@@ -1709,6 +1827,9 @@ internal static class Program
         return entries;
     }
 
+    /// <summary>Extracts the camera's native path prefix through its DCIM directory.</summary>
+    /// <param name="filePath">A native camera file path from the listing.</param>
+    /// <returns>The prefix ending in a backslash, or null if DCIM is absent.</returns>
     private static string? GetCameraFilePathPrefix(string filePath)
     {
         string[] pathSegments = filePath.Replace('/', '\\').Split('\\');
@@ -1722,6 +1843,9 @@ internal static class Program
         return string.Join("\\", pathSegments.Take(dcimIndex + 1)) + "\\";
     }
 
+    /// <summary>Validates and splits a camera file path into segments relative to DCIM.</summary>
+    /// <param name="filePath">A native camera file path from the listing.</param>
+    /// <returns>The validated path segments below DCIM.</returns>
     private static string[] GetCameraRelativeFileSegments(string filePath)
     {
         string[] pathSegments = filePath.Replace('\\', '/').Split('/');
@@ -1744,6 +1868,12 @@ internal static class Program
         return relativeSegments;
     }
 
+    /// <summary>Sends the camera's delete command and checks its response status.</summary>
+    /// <param name="ipAddress">The camera's IP address for logging.</param>
+    /// <param name="path">The file's relative path for logging.</param>
+    /// <param name="fileUri">The file URI used to address the camera.</param>
+    /// <param name="cameraFilePath">The camera's native path for the delete command.</param>
+    /// <returns>An error message if deletion was not confirmed and whether a transport failure occurred.</returns>
     private static async Task<(string? Error, bool TransportFailure)> SendCameraDeleteRequest(
         string ipAddress,
         string path,
@@ -1779,6 +1909,9 @@ internal static class Program
         }
     }
 
+    /// <summary>Checks whether a camera delete response contains a successful status.</summary>
+    /// <param name="xml">The camera's XML response.</param>
+    /// <returns>True when the response status is zero; otherwise, false.</returns>
     private static bool HasSuccessfulCameraDeleteStatus(string xml)
     {
         XDocument response;
@@ -1803,6 +1936,12 @@ internal static class Program
         return status?.Value.Trim() == "0";
     }
 
+    /// <summary>Validates a relative path and resolves it to a URI under the camera's DCIM root.</summary>
+    /// <param name="ipAddress">The camera's IP address.</param>
+    /// <param name="relativePath">The path relative to DCIM.</param>
+    /// <param name="isDirectory">Whether the path identifies a directory rather than a file.</param>
+    /// <param name="resolvedUri">Receives the resolved URI, or null when validation fails.</param>
+    /// <returns>True if the path resolves safely; otherwise, false.</returns>
     private static bool TryResolveCameraPath(
         string ipAddress,
         string relativePath,
@@ -1865,6 +2004,9 @@ internal static class Program
         return true;
     }
 
+    /// <summary>Identifies exceptions handled as camera or local download failures.</summary>
+    /// <param name="exception">The exception to classify.</param>
+    /// <returns>True if the exception is handled as a download failure.</returns>
     private static bool IsDownloadException(Exception exception)
     {
         return exception is HttpRequestException
@@ -1873,6 +2015,9 @@ internal static class Program
             || exception is UnauthorizedAccessException;
     }
 
+    /// <summary>Identifies transient transfer and HTTP failures eligible for retry.</summary>
+    /// <param name="exception">The exception to classify.</param>
+    /// <returns>True if the failure is eligible for retry.</returns>
     private static bool IsRetryableDownloadException(Exception exception)
     {
         if (exception is HttpRequestException httpException)
@@ -1891,6 +2036,12 @@ internal static class Program
         return exception is OperationCanceledException || exception is DownloadInterruptedException;
     }
 
+    /// <summary>Reports a retryable failure and waits before attempting the operation again.</summary>
+    /// <param name="cameraName">The camera's display name for logging.</param>
+    /// <param name="uri">The URI of the failed operation.</param>
+    /// <param name="exception">The failure that caused the retry.</param>
+    /// <param name="progress">The state to mark as retrying.</param>
+    /// <param name="cancellationToken">Interrupts the retry delay.</param>
     private static void WaitBeforeRetry(
         string cameraName,
         Uri uri,
@@ -1907,6 +2058,10 @@ internal static class Program
         }
     }
 
+    /// <summary>Logs a failure while processing a camera URI.</summary>
+    /// <param name="cameraName">The camera's display name.</param>
+    /// <param name="uri">The URI that could not be processed.</param>
+    /// <param name="exception">The failure to report.</param>
     private static void PrintDownloadFailure(string cameraName, Uri uri, Exception exception)
     {
         Console.WriteLine($"Unable to process {uri.AbsolutePath} for {cameraName}: {exception.Message}");
@@ -1921,6 +2076,8 @@ internal static class Program
         private CancellationTokenSource? activeScan;
         private bool pauseRequested;
 
+        /// <summary>Acquires the scan lock and creates a cancellation source unless a pause is pending.</summary>
+        /// <returns>The active scan's cancellation source, or null if a pause was requested.</returns>
         public CancellationTokenSource? BeginScan()
         {
             scanLock.Wait();
@@ -1937,6 +2094,8 @@ internal static class Program
             }
         }
 
+        /// <summary>Clears the active scan and releases the scan lock.</summary>
+        /// <param name="scan">The cancellation source returned for the scan being ended.</param>
         public void EndScan(CancellationTokenSource scan)
         {
             lock (syncRoot)
@@ -1950,6 +2109,8 @@ internal static class Program
             scanLock.Release();
         }
 
+        /// <summary>Cancels an active scan and waits for exclusive access to the camera.</summary>
+        /// <returns>A task that completes once the camera is paused.</returns>
         public async Task PauseScanAsync()
         {
             // Serialize pause requests and wait for the cancelled scan to release the camera.
@@ -1963,6 +2124,7 @@ internal static class Program
             await scanLock.WaitAsync();
         }
 
+        /// <summary>Ends a pause and releases the camera and pause locks.</summary>
         public void ResumeScan()
         {
             lock (syncRoot)
@@ -1974,6 +2136,7 @@ internal static class Program
             pauseLock.Release();
         }
 
+        /// <summary>Signals the worker to scan, coalescing pending requests.</summary>
         public void RequestScan()
         {
             lock (syncRoot)
@@ -1985,6 +2148,9 @@ internal static class Program
             }
         }
 
+        /// <summary>Waits for a scan request or the next scheduled scan.</summary>
+        /// <param name="timeout">The maximum time to wait for a request.</param>
+        /// <returns>A task yielding true for a request or false on timeout.</returns>
         public Task<bool> WaitForScanRequestAsync(TimeSpan timeout)
         {
             return scanRequestSignal.WaitAsync(timeout);
@@ -2040,6 +2206,9 @@ internal static class Program
 
     private sealed class DownloadInterruptedException : IOException
     {
+        /// <summary>Creates an exception for an interrupted camera transfer.</summary>
+        /// <param name="uri">The camera URI whose transfer was interrupted.</param>
+        /// <param name="innerException">The underlying transfer failure.</param>
         public DownloadInterruptedException(Uri uri, Exception innerException)
             : base($"Transfer interrupted for {uri.AbsolutePath}.", innerException)
         {

@@ -11,12 +11,18 @@ internal sealed class CameraSizeLimitStore
     private readonly string path;
     private Dictionary<string, long> limitsBytes;
 
+    /// <summary>Creates a store for persisted per-camera limits.</summary>
+    /// <param name="path">The path to the limits file.</param>
+    /// <param name="limitsBytes">The initial limits keyed by camera IP address.</param>
     private CameraSizeLimitStore(string path, Dictionary<string, long> limitsBytes)
     {
         this.path = path;
         this.limitsBytes = limitsBytes;
     }
 
+    /// <summary>Loads camera limits and migrates legacy megabyte values when needed.</summary>
+    /// <param name="destinationRoot">The download root containing the limits file.</param>
+    /// <returns>The loaded limit store.</returns>
     public static CameraSizeLimitStore Load(string destinationRoot)
     {
         Directory.CreateDirectory(destinationRoot);
@@ -87,6 +93,9 @@ internal sealed class CameraSizeLimitStore
         return store;
     }
 
+    /// <summary>Retrieves a camera's configured storage limit.</summary>
+    /// <param name="cameraIpAddress">The camera's IP address.</param>
+    /// <returns>The limit in bytes, or zero if none is configured.</returns>
     public long Get(string cameraIpAddress)
     {
         lock (syncRoot)
@@ -95,6 +104,9 @@ internal sealed class CameraSizeLimitStore
         }
     }
 
+    /// <summary>Persists a camera's storage limit.</summary>
+    /// <param name="cameraIpAddress">The camera's IP address.</param>
+    /// <param name="maxSizeBytes">The nonnegative limit in bytes, or zero for unlimited.</param>
     public void Set(string cameraIpAddress, long maxSizeBytes)
     {
         if (maxSizeBytes < 0)
@@ -113,6 +125,10 @@ internal sealed class CameraSizeLimitStore
         }
     }
 
+    /// <summary>Converts a nonnegative binary-gigabyte limit to bytes when it fits.</summary>
+    /// <param name="maxSizeGb">The limit in binary gigabytes.</param>
+    /// <param name="maxSizeBytes">Receives the converted limit in bytes.</param>
+    /// <returns>True if the value is valid and representable; otherwise, false.</returns>
     public static bool TryConvertGbToBytes(decimal maxSizeGb, out long maxSizeBytes)
     {
         maxSizeBytes = 0;
@@ -125,11 +141,16 @@ internal sealed class CameraSizeLimitStore
         return true;
     }
 
+    /// <summary>Converts bytes to binary gigabytes.</summary>
+    /// <param name="bytes">The byte count to convert.</param>
+    /// <returns>The equivalent size in binary gigabytes.</returns>
     public static decimal ConvertBytesToGb(long bytes)
     {
         return (decimal)bytes / BytesPerGigabyte;
     }
 
+    /// <summary>Persists the supplied limits using a temporary file.</summary>
+    /// <param name="updatedLimits">The camera IP addresses and byte limits to write.</param>
     private void Write(Dictionary<string, long> updatedLimits)
     {
         string temporaryPath = path + ".tmp";
@@ -162,6 +183,9 @@ internal static class CameraDiskUsageReader
         AttributesToSkip = FileAttributes.ReparsePoint
     };
 
+    /// <summary>Counts completed files and their bytes under a camera's local root.</summary>
+    /// <param name="cameraRoot">The local camera directory to inspect.</param>
+    /// <returns>The file count and total size, excluding application files.</returns>
     public static CameraDiskUsage Read(string cameraRoot)
     {
         if (!Directory.Exists(cameraRoot))
@@ -185,6 +209,10 @@ internal static class CameraDiskUsageReader
         return new CameraDiskUsage(fileCount, totalBytes);
     }
 
+    /// <summary>Deletes oldest unprotected files until usage is within the configured limit.</summary>
+    /// <param name="cameraRoot">The local camera directory to trim.</param>
+    /// <param name="maxSizeBytes">The limit in bytes, or zero to disable cleanup.</param>
+    /// <returns>The paths of files deleted during cleanup.</returns>
     public static IReadOnlyList<string> TrimOldestFiles(string cameraRoot, long maxSizeBytes)
     {
         if (maxSizeBytes == 0 || !Directory.Exists(cameraRoot))
@@ -225,6 +253,9 @@ internal static class CameraDiskUsageReader
         return deletedFiles;
     }
 
+    /// <summary>Removes empty parent directories without deleting the camera root or protected folders.</summary>
+    /// <param name="cameraRoot">The local camera directory that bounds cleanup.</param>
+    /// <param name="directoryPath">The first directory to inspect.</param>
     private static void RemoveEmptyParentDirectories(string cameraRoot, string? directoryPath)
     {
         string fullCameraRoot = Path.GetFullPath(cameraRoot);
@@ -249,6 +280,9 @@ internal static class CameraDiskUsageReader
         }
     }
 
+    /// <summary>Identifies application metadata and incomplete downloads excluded from disk usage.</summary>
+    /// <param name="path">The file path to inspect.</param>
+    /// <returns>True if the file is application metadata or an incomplete download.</returns>
     private static bool IsApplicationFile(string path)
     {
         string name = Path.GetFileName(path);
@@ -261,11 +295,20 @@ internal static class CameraDiskUsageReader
             || name.EndsWith(".download", StringComparison.OrdinalIgnoreCase);
     }
 
+    /// <summary>Checks whether a file is inside a protected RO folder.</summary>
+    /// <param name="cameraRoot">The local camera root.</param>
+    /// <param name="filePath">The file path to inspect.</param>
+    /// <returns>True if the file is inside an RO folder.</returns>
     private static bool IsInReadOnlyFolder(string cameraRoot, string filePath)
     {
         return IsInReadOnlyFolder(cameraRoot, filePath, pathIsDirectory: false);
     }
 
+    /// <summary>Checks whether a file or directory is inside a protected RO folder.</summary>
+    /// <param name="cameraRoot">The local camera root.</param>
+    /// <param name="filePath">The file or directory path to inspect.</param>
+    /// <param name="pathIsDirectory">Whether the supplied path itself is a directory.</param>
+    /// <returns>True if the path is in or is an RO folder.</returns>
     private static bool IsInReadOnlyFolder(string cameraRoot, string filePath, bool pathIsDirectory)
     {
         if (Path.GetFileName(Path.TrimEndingDirectorySeparator(cameraRoot))

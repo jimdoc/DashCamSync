@@ -27,6 +27,9 @@ internal sealed class CameraProgress
 
     public event Action? Reconnected;
 
+    /// <summary>Creates shared progress state for a camera.</summary>
+    /// <param name="ipAddress">The camera's IP address.</param>
+    /// <param name="cameraName">The camera's display name.</param>
     public CameraProgress(string ipAddress, string cameraName)
     {
         this.ipAddress = ipAddress;
@@ -35,6 +38,8 @@ internal sealed class CameraProgress
 
     public string IpAddress => ipAddress;
 
+    /// <summary>Marks the download queue ready and sets its pending file count.</summary>
+    /// <param name="fileCount">The number of files in the queue.</param>
     public void SetQueue(int fileCount)
     {
         lock (syncRoot)
@@ -53,6 +58,7 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Resets queue and transfer progress for a new camera scan.</summary>
     public void BeginScan()
     {
         lock (syncRoot)
@@ -72,6 +78,8 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Updates the transfer status.</summary>
+    /// <param name="status">The status to report on the dashboard.</param>
     public void SetTransferStatus(string status)
     {
         lock (syncRoot)
@@ -80,6 +88,10 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Updates measured queue byte totals.</summary>
+    /// <param name="totalBytes">The measured total bytes in the queue.</param>
+    /// <param name="completedBytes">The completed bytes included in the queue.</param>
+    /// <param name="incomplete">Whether some file sizes could not be measured.</param>
     public void SetQueueBytes(long totalBytes, long completedBytes, bool incomplete)
     {
         lock (syncRoot)
@@ -90,6 +102,9 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Updates the camera's local disk usage statistics.</summary>
+    /// <param name="fileCount">The number of completed files on disk.</param>
+    /// <param name="totalBytes">The total size of those files in bytes.</param>
     public void SetOnDiskStatistics(long fileCount, long totalBytes)
     {
         lock (syncRoot)
@@ -99,6 +114,8 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Updates the storage limit reported on the dashboard.</summary>
+    /// <param name="value">The limit in binary gigabytes, or zero for unlimited.</param>
     public void SetMaxSizeGb(decimal value)
     {
         lock (syncRoot)
@@ -107,6 +124,8 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Reports files deleted during storage-limit cleanup.</summary>
+    /// <param name="deletedFiles">The paths removed by cleanup; an empty list leaves the status unchanged.</param>
     public void SetStorageCleanupStatus(IReadOnlyList<string> deletedFiles)
     {
         if (deletedFiles.Count == 0)
@@ -121,6 +140,7 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Records camera contact and raises the reconnection event when appropriate.</summary>
     public void MarkConnected()
     {
         bool wasReconnecting;
@@ -142,6 +162,8 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Marks the camera disconnected and stops reporting transfer speed.</summary>
+    /// <param name="error">The connection error to report.</param>
     public void MarkDisconnected(string error)
     {
         lock (syncRoot)
@@ -156,6 +178,8 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Marks the camera as waiting to retry after a connection failure.</summary>
+    /// <param name="error">The failure that caused the retry.</param>
     public void MarkRetrying(string error)
     {
         lock (syncRoot)
@@ -167,6 +191,7 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Marks the transfer as paused while camera files are deleted.</summary>
     public void PauseForDeletion()
     {
         lock (syncRoot)
@@ -176,6 +201,8 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Marks the connection and transfer as failed.</summary>
+    /// <param name="error">The error to report.</param>
     public void MarkError(string error)
     {
         lock (syncRoot)
@@ -187,6 +214,10 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Starts tracking a file transfer, including any previously downloaded bytes.</summary>
+    /// <param name="filePath">The camera file path to report.</param>
+    /// <param name="initialBytes">The number of bytes already downloaded.</param>
+    /// <param name="totalBytes">The expected total file size, if known.</param>
     public void BeginFile(string filePath, long initialBytes, long? totalBytes)
     {
         lock (syncRoot)
@@ -200,6 +231,10 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Updates the current transfer and records camera contact.</summary>
+    /// <param name="currentBytes">The number of bytes downloaded for the current file.</param>
+    /// <param name="totalBytes">The expected total file size, if known.</param>
+    /// <param name="currentSpeed">The current transfer speed in bytes per second.</param>
     public void UpdateFileProgress(long currentBytes, long? totalBytes, double currentSpeed)
     {
         lock (syncRoot)
@@ -212,6 +247,9 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Records a completed file and clears the current transfer.</summary>
+    /// <param name="fileBytes">The completed file size in bytes.</param>
+    /// <param name="sizeWasMeasured">Whether the file was already included in the measured queue total.</param>
     public void CompleteFile(long fileBytes, bool sizeWasMeasured)
     {
         lock (syncRoot)
@@ -231,6 +269,7 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Marks all queued files complete and clears current transfer state.</summary>
     public void MarkComplete()
     {
         lock (syncRoot)
@@ -245,6 +284,7 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Finishes the queue, reporting completion or an incomplete transfer as appropriate.</summary>
     public void Finish()
     {
         lock (syncRoot)
@@ -266,6 +306,8 @@ internal sealed class CameraProgress
         }
     }
 
+    /// <summary>Creates a consistent dashboard snapshot, accounting for stale camera contact.</summary>
+    /// <returns>The camera's current connection, transfer, and storage statistics.</returns>
     public CameraSnapshot CreateSnapshot()
     {
         lock (syncRoot)

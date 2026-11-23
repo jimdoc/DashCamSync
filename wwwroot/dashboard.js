@@ -8,6 +8,11 @@ const activityRefreshIntervalMs = 5000;
 let lastActivityRenderAt = 0;
 let emptyStateElement = cameraList.querySelector(".empty-state");
 
+/**
+ * Escapes a value for insertion into HTML.
+ * @param {*} value Value to escape.
+ * @returns {string} HTML-escaped text.
+ */
 function escapeHtml(value) {
   const characters = {
     "&": "&amp;",
@@ -19,6 +24,11 @@ function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, character => characters[character]);
 }
 
+/**
+ * Formats a byte count using binary units.
+ * @param {number} bytes Byte count to format.
+ * @returns {string} Formatted size.
+ */
 function formatBytes(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) {
     return "0 B";
@@ -39,6 +49,11 @@ function formatBytes(bytes) {
   return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 
+/**
+ * Formats a disk size as rounded binary gigabytes.
+ * @param {number} bytes Byte count to format.
+ * @returns {string} Formatted size.
+ */
 function formatDiskSize(bytes) {
   if (!Number.isFinite(bytes) || bytes <= 0) {
     return "0 GB";
@@ -48,18 +63,39 @@ function formatDiskSize(bytes) {
   return `${Math.round(value).toLocaleString()} GB`;
 }
 
+/**
+ * Formats a transfer speed.
+ * @param {number} bytesPerSecond Transfer speed in bytes per second.
+ * @returns {string} Formatted speed.
+ */
 function formatSpeed(bytesPerSecond) {
   return `${formatBytes(bytesPerSecond)}/s`;
 }
 
+/**
+ * Formats a byte count as rounded binary megabytes.
+ * @param {number} bytes Byte count to format.
+ * @returns {string} Formatted size.
+ */
 function formatMegabytes(bytes) {
   return `${Math.round(Math.max(0, bytes) / 1048576).toLocaleString()} MB`;
 }
 
+/**
+ * Builds a CSS class name from a status.
+ * @param {string} prefix Class name prefix.
+ * @param {string} status Status to normalize.
+ * @returns {string} Status class name.
+ */
 function stateClass(prefix, status) {
   return `${prefix}-${String(status || "unknown").toLowerCase().replaceAll(" ", "-")}`;
 }
 
+/**
+ * Updates an element's text only when it has changed.
+ * @param {Element} element Element to update.
+ * @param {*} value Value to display as text.
+ */
 function setTextIfChanged(element, value) {
   const text = String(value);
   if (element.textContent !== text) {
@@ -67,6 +103,11 @@ function setTextIfChanged(element, value) {
   }
 }
 
+/**
+ * Creates a camera card and wires its scan, browser, deletion, and storage controls.
+ * @param {object} camera Camera snapshot used to identify the camera.
+ * @returns {object} Card elements and browser state.
+ */
 function createCameraCard(camera) {
   const element = document.createElement("article");
   element.className = "camera-card";
@@ -312,6 +353,10 @@ function createCameraCard(camera) {
   return card;
 }
 
+/**
+ * Updates the file browser's selection count and controls.
+ * @param {object} card Camera card containing the file browser.
+ */
 function updateFileSelection(card) {
   const checkboxes = Array.from(card.fileBrowserList.querySelectorAll(".file-browser-select"));
   const selected = checkboxes.filter(checkbox => checkbox.checked).length;
@@ -322,6 +367,11 @@ function updateFileSelection(card) {
   setTextIfChanged(card.fileBrowserSelectionCount, `${selected} selected`);
 }
 
+/**
+ * Enables or disables file browser controls during deletion.
+ * @param {object} card Camera card containing the file browser.
+ * @param {boolean} busy Whether a deletion is in progress.
+ */
 function setFileDeleteBusy(card, busy) {
   card.fileDeleteInProgress = busy;
   card.fileBrowserButton.disabled = busy;
@@ -332,6 +382,13 @@ function setFileDeleteBusy(card, busy) {
   updateFileSelection(card);
 }
 
+/**
+ * Loads and renders a camera directory, ignoring stale listing responses.
+ * @param {object} card Camera card containing the file browser.
+ * @param {object} camera Camera snapshot identifying the camera.
+ * @param {string} [path=""] Directory path relative to DCIM.
+ * @returns {Promise<void>} A promise that resolves after rendering or reporting an error.
+ */
 async function loadCameraFiles(card, camera, path = "") {
   const requestId = ++card.fileBrowserRequestId;
   card.fileBrowserPathValue = path;
@@ -513,6 +570,12 @@ async function loadCameraFiles(card, camera, path = "") {
   }
 }
 
+/**
+ * Updates a progress bar's visual width and accessible value.
+ * @param {Element} track Progress bar element.
+ * @param {HTMLElement} fill Element displaying the filled portion.
+ * @param {number} percentage Progress percentage, bounded to 0–100.
+ */
 function updateProgress(track, fill, percentage) {
   const boundedPercentage = Math.min(100, Math.max(0, percentage));
   const width = `${boundedPercentage.toFixed(2)}%`;
@@ -526,6 +589,11 @@ function updateProgress(track, fill, percentage) {
   }
 }
 
+/**
+ * Updates an existing camera card from its latest snapshot.
+ * @param {object} card Camera card elements and state.
+ * @param {object} camera Latest camera snapshot.
+ */
 function updateCameraCard(card, camera) {
   const currentFile = camera.currentFile || "No active file";
   let currentProgressText = "Waiting for transfer";
@@ -586,6 +654,10 @@ function updateCameraCard(card, camera) {
   card.errorMessage.hidden = !camera.lastError;
 }
 
+/**
+ * Creates, orders, updates, or removes camera cards to match the snapshots.
+ * @param {object[]} cameras Current camera snapshots.
+ */
 function renderCameraActivity(cameras) {
   if (cameras.length === 0) {
     for (const card of cameraCards.values()) {
@@ -632,6 +704,11 @@ function renderCameraActivity(cameras) {
   });
 }
 
+/**
+ * Renders aggregate dashboard status and optionally updates the camera cards.
+ * @param {object} snapshot Latest dashboard status response.
+ * @param {boolean} updateCameraActivity Whether to refresh the camera cards.
+ */
 function renderDashboard(snapshot, updateCameraActivity) {
   document.getElementById("camera-count").textContent = snapshot.cameraCount.toLocaleString();
   document.getElementById("aggregate-speed").textContent = formatSpeed(snapshot.aggregateBytesPerSecond);
@@ -663,6 +740,10 @@ function renderDashboard(snapshot, updateCameraActivity) {
   renderCameraActivity(snapshot.cameras);
 }
 
+/**
+ * Fetches dashboard status and displays the result or a connection error.
+ * @returns {Promise<void>} A promise that resolves after the dashboard is updated.
+ */
 async function refreshDashboard() {
   try {
     const response = await fetch("/api/status", { cache: "no-store" });
