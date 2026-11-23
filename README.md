@@ -1,4 +1,9 @@
-# Docker Setup
+# DashCamSync
+I created this project to automatically copy videos from my 2 Viofo dashcams to my NAS.
+To make this work, the dash cams must be set to "station mode". Please contact Viofo customer support for special firmware for your dashcam that allows it to remain in station mode.
+While parked at home, the camera must remain powered on for videos to be copied. To do this you must make sure that parking mode stays active long enough for files to be copied. I recommend a hard-wire kit that will power off before draining your battery.
+
+## Docker Setup
 
 The container reads camera addresses and names from numbered environment-variable pairs. Pair numbers must be consecutive, starting at 1.
 
