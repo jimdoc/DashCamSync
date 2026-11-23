@@ -233,7 +233,8 @@ internal static class Program
                 scanningCameras,
                 snapshots,
                 BuildVersion,
-                BuildTimeUtc));
+                BuildTimeUtc,
+                GetAvailableStorageBytes(destinationRoot)));
         });
         /// <summary>Signals the camera worker to perform a scan.</summary>
         /// <param name="ipAddress">The configured camera's IP address.</param>
@@ -606,6 +607,22 @@ internal static class Program
         {
             Console.Error.WriteLine($"Dashboard failed to start on {configuredDashboardUrl}: {ex}");
             throw;
+        }
+    }
+
+    /// <summary>Reads the free space available to the process at the download root.</summary>
+    /// <param name="destinationRoot">The download directory whose filesystem is queried.</param>
+    /// <returns>The available bytes, or null if the space cannot be read.</returns>
+    private static long? GetAvailableStorageBytes(string destinationRoot)
+    {
+        try
+        {
+            return new DriveInfo(Path.GetFullPath(destinationRoot)).AvailableFreeSpace;
+        }
+        catch (Exception ex) when (ex is IOException || ex is UnauthorizedAccessException)
+        {
+            Console.Error.WriteLine($"Unable to read available space for {destinationRoot}: {ex.Message}");
+            return null;
         }
     }
 
@@ -2179,7 +2196,8 @@ internal static class Program
         int ScanningCameras,
         IReadOnlyList<CameraSnapshot> Cameras,
         string Version,
-        string BuildTimeUtc);
+        string BuildTimeUtc,
+        long? AvailableStorageBytes);
 
     private sealed record CameraSizeLimitRequest(decimal MaxSizeGb);
 

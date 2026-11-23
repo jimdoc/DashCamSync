@@ -64,6 +64,8 @@ For persistent downloads, add a volume mapping with the NAS folder on the left a
 
 The Compose project uses host networking. The dashboard listens directly on the port set by `DASHCAM_PORT` (default `8081`); no port mapping is used. Open `http://<NAS-IP>:<DASHCAM_PORT>` in a browser.
 
+The dashboard's **Available space** shows the free space available to the application on the filesystem containing the download root. It updates with dashboard status and shows **Unavailable** if the space cannot be read.
+
 Each camera shows the number and total size of files currently in its download folder. These values are recalculated whenever the dashboard requests status, so manual deletions and additions are reflected on the next refresh. Incomplete `.download` files and application metadata are excluded.
 
 Each camera's files are downloaded oldest first, based on the camera's file timestamps.

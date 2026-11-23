@@ -718,6 +718,10 @@ function renderDashboard(snapshot, updateCameraActivity) {
   }
   document.getElementById("files-left").textContent = filesLeftText;
   document.getElementById("files-complete").innerHTML = `${snapshot.completedFiles.toLocaleString()} <span class="summary-secondary">/ ${snapshot.totalFiles.toLocaleString()}</span>`;
+  document.getElementById("available-space").textContent =
+    Number.isFinite(snapshot.availableStorageBytes) && snapshot.availableStorageBytes >= 0
+      ? formatBytes(snapshot.availableStorageBytes)
+      : "Unavailable";
 
   const overallProgress = Math.min(100, Math.max(0, snapshot.overallProgressPercent));
   document.getElementById("overall-progress-label").textContent = `${overallProgress.toFixed(0)}%`;
