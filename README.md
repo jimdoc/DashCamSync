@@ -5,6 +5,8 @@ To make this work, the dash cams must be set to "station mode". Please contact V
 
 While parked at home, the camera must remain powered on for videos to be copied. To do this you must make sure that parking mode stays active long enough for files to be copied. I recommend a hard-wire kit that will power off before draining your battery.
 
+This project is installed as a docker style package on my Synology NAS using the Synology Container Manager.
+
 ## Docker Setup
 
 The container reads camera addresses and names from numbered environment-variable pairs. Pair numbers must be consecutive, starting at 1.
