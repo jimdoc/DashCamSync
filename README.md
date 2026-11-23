@@ -13,6 +13,27 @@ This project is installed as a docker style package on my Synology NAS using the
 
 The container reads camera addresses and names from numbered environment-variable pairs. Pair numbers must be consecutive, starting at 1.
 
+## Synology Container Manager Project
+
+1. Install **Container Manager** from DSM's Package Center. Copy or clone the complete repository into a folder on the NAS, for example `/volume1/docker/DashCamSync`. The folder must contain `compose.yaml`, `Dockerfile`, `DashCamSync.csproj`, the source files, and `wwwroot`; the Compose file alone is not enough to build the image.
+2. Create the download folder on the NAS, for example `/volume1/Data/DashCam`, and ensure the container can write to it. Keep the download folder separate from the source folder.
+3. Open **Container Manager > Project** and select **Create**. Choose a project name and select the repository folder as the project path. The supplied `build: context: .` uses this folder as its build context.
+4. Choose the option to create `docker-compose.yml` and paste in the contents of the repository's `compose.yaml`. In the configuration editor, replace the example camera values with your cameras' IP addresses and names. For example, change the corresponding entries under `environment` to:
+
+   ```yaml
+      DASHCAM_PORT: "8081"
+      DASHCAM_CAMERA_1_IP: "192.168.1.58"
+      DASHCAM_CAMERA_1_NAME: "Impreza Dashcam"
+      DASHCAM_CAMERA_2_IP: "192.168.1.57"
+      DASHCAM_CAMERA_2_NAME: "Forrester Dashcam"
+   ```
+
+   Keep `DASHCAM_REQUIRE_CAMERA_SETTINGS`, `DASHCAM_DOWNLOAD_ROOT`, and `network_mode: host` as supplied. To use a different download folder, change the host side of the `volumes` mapping, leaving the container side as `/volume1/Data/DashCam`. Remove both entries for camera 2 if you have only one camera, or add consecutive numbered pairs for additional cameras.
+5. Continue through the wizard without configuring a Web Station web portal, review the settings, and create the project. Container Manager builds the image from the local source and starts the service. The first build requires internet access to obtain the .NET base images and restore dependencies.
+6. Check the project and container logs for build or startup errors. Open `http://<NAS-IP>:8081` on your local network, substituting your chosen `DASHCAM_PORT` if different. Allow that TCP port through the DSM firewall for your LAN if necessary.
+
+After updating the source or project configuration, rebuild and recreate the project using Container Manager so the changes take effect. Preserve the download folder when removing or recreating a project. Menu labels may vary between Container Manager versions.
+
 ## Docker Desktop
 
 Select the latest `dashcamsync-dashcam-sync` image and open **Optional settings**.
