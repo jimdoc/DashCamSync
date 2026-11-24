@@ -789,6 +789,7 @@ internal static class Program
             sizeLimitLock.Wait(cancellationToken);
             try
             {
+                CleanUpTemporaryFiles(localRoot, cameraName);
                 IReadOnlyList<string> deletedPaths = CameraDiskUsageReader.TrimOldestFiles(
                     localRoot,
                     sizeLimitStore.Get(progress.IpAddress));
@@ -798,11 +799,10 @@ internal static class Program
             {
                 sizeLimitLock.Release();
             }
-
-            CleanUpTemporaryFiles(localRoot, cameraName);
             string manifestPath = Path.Combine(localRoot, ".downloaded-files.json");
             Dictionary<string, DateTime> downloadedFiles = LoadDownloadedFiles(manifestPath, cameraName);
             List<DownloadCandidate> downloads = new List<DownloadCandidate>();
+            Directory.CreateDirectory(localRoot);
             CollectDownloads(remoteRoot, localRoot, cameraName, downloads, progress, cancellationToken);
 
             List<DownloadCandidate> prioritizedDownloads = downloads
@@ -828,7 +828,6 @@ internal static class Program
                 cancellationToken.ThrowIfCancellationRequested();
                 try
                 {
-                    Directory.CreateDirectory(Path.GetDirectoryName(download.DestinationPath)!);
                     long? completedLength = DownloadFile(
                         download.FileUri,
                         download.DestinationPath,
@@ -1031,7 +1030,6 @@ internal static class Program
         CameraProgress progress,
         CancellationToken cancellationToken)
     {
-        Directory.CreateDirectory(localDirectory);
         List<RemoteEntry> entries = GetEntriesWithRetry(remoteDirectory, cameraName, progress, cancellationToken);
 
         foreach (RemoteEntry entry in entries)
@@ -1131,7 +1129,7 @@ internal static class Program
             cancellationToken.ThrowIfCancellationRequested();
             try
             {
-                DownloadToPartialFile(fileUri, partialPath, cameraName, progress, cancellationToken);
+                DownloadToPartialFile(fileUri, partialPath, cameraName, progress, sizeLimitLock, cancellationToken);
                 break;
             }
             catch (Exception ex) when (IsRetryableDownloadException(ex) && !cancellationToken.IsCancellationRequested)
@@ -1359,12 +1357,14 @@ internal static class Program
     /// <param name="partialPath">The path of the incomplete local file.</param>
     /// <param name="cameraName">The camera's display name for logging.</param>
     /// <param name="progress">The state to update during the transfer.</param>
+    /// <param name="sizeLimitLock">The lock protecting this camera's storage cleanup.</param>
     /// <param name="cancellationToken">Cancels the request or transfer.</param>
     private static void DownloadToPartialFile(
         Uri fileUri,
         string partialPath,
         string cameraName,
         CameraProgress progress,
+        SemaphoreSlim sizeLimitLock,
         CancellationToken cancellationToken)
     {
         long partialLength = 0;
@@ -1392,7 +1392,7 @@ internal static class Program
 
             File.Delete(partialPath);
             Console.WriteLine($"Restarting download because the remote file size changed: {fileUri.AbsolutePath}");
-            DownloadToPartialFile(fileUri, partialPath, cameraName, progress, cancellationToken);
+            DownloadToPartialFile(fileUri, partialPath, cameraName, progress, sizeLimitLock, cancellationToken);
             return;
         }
 
@@ -1429,7 +1429,19 @@ internal static class Program
             fileMode = FileMode.Create;
         }
 
-        using FileStream destination = new FileStream(partialPath, fileMode, FileAccess.Write);
+        FileStream destinationFile;
+        sizeLimitLock.Wait(cancellationToken);
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(partialPath)!);
+            destinationFile = new FileStream(partialPath, fileMode, FileAccess.Write);
+        }
+        finally
+        {
+            sizeLimitLock.Release();
+        }
+
+        using FileStream destination = destinationFile;
         CopyResponseToFile(source, destination, fileUri, cameraName, expectedLength, progress, cancellationToken);
         destination.Flush();
 

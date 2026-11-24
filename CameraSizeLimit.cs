@@ -209,7 +209,7 @@ internal static class CameraDiskUsageReader
         return new CameraDiskUsage(fileCount, totalBytes);
     }
 
-    /// <summary>Deletes oldest unprotected files until usage is within the configured limit.</summary>
+    /// <summary>Deletes oldest unprotected files until usage is within the configured limit and removes empty folders.</summary>
     /// <param name="cameraRoot">The local camera directory to trim.</param>
     /// <param name="maxSizeBytes">The limit in bytes, or zero to disable cleanup.</param>
     /// <returns>The paths of files deleted during cleanup.</returns>
@@ -247,36 +247,34 @@ internal static class CameraDiskUsageReader
             totalBytes -= fileLength;
             deletedFiles.Add(file.FullName);
             Console.WriteLine($"Removed oldest file to enforce the camera size limit: {file.FullName}");
-            RemoveEmptyParentDirectories(cameraRoot, Path.GetDirectoryName(file.FullName));
         }
 
+        RemoveEmptyDirectories(cameraRoot);
         return deletedFiles;
     }
 
-    /// <summary>Removes empty parent directories without deleting the camera root or protected folders.</summary>
+    /// <summary>Removes empty directories without deleting the camera root or protected folders.</summary>
     /// <param name="cameraRoot">The local camera directory that bounds cleanup.</param>
-    /// <param name="directoryPath">The first directory to inspect.</param>
-    private static void RemoveEmptyParentDirectories(string cameraRoot, string? directoryPath)
+    private static void RemoveEmptyDirectories(string cameraRoot)
     {
-        string fullCameraRoot = Path.GetFullPath(cameraRoot);
-        while (!string.IsNullOrEmpty(directoryPath))
+        List<string> directories = Directory.EnumerateDirectories(cameraRoot, "*", EnumerationOptions)
+            .OrderByDescending(path => path.Length)
+            .ToList();
+        foreach (string directoryPath in directories)
         {
-            string fullDirectoryPath = Path.GetFullPath(directoryPath);
-            if (string.Equals(fullDirectoryPath, fullCameraRoot, StringComparison.Ordinal)
-                || IsInReadOnlyFolder(cameraRoot, fullDirectoryPath, pathIsDirectory: true))
+            if (IsInReadOnlyFolder(cameraRoot, directoryPath, pathIsDirectory: true))
             {
-                return;
+                continue;
             }
 
-            if (!Directory.Exists(fullDirectoryPath)
-                || Directory.EnumerateFileSystemEntries(fullDirectoryPath).Any())
+            if (!Directory.Exists(directoryPath)
+                || Directory.EnumerateFileSystemEntries(directoryPath).Any())
             {
-                return;
+                continue;
             }
 
-            Directory.Delete(fullDirectoryPath);
-            Console.WriteLine($"Removed empty folder after size-limit cleanup: {fullDirectoryPath}");
-            directoryPath = Path.GetDirectoryName(fullDirectoryPath);
+            Directory.Delete(directoryPath);
+            Console.WriteLine($"Removed empty folder after size-limit cleanup: {directoryPath}");
         }
     }
 
