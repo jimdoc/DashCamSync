@@ -337,7 +337,8 @@ h2 {
 .camera-files-button,
 .camera-rescan-button,
 .file-browser-close,
-.file-browser-up {
+.file-browser-up,
+.file-browser-prioritize {
   padding: 6px 9px;
   color: var(--teal);
   background: var(--surface);
@@ -349,7 +350,8 @@ h2 {
 }
 
 .camera-files-button:disabled,
-.camera-rescan-button:disabled {
+.camera-rescan-button:disabled,
+.file-browser-prioritize:disabled {
   cursor: wait;
   opacity: 0.65;
 }

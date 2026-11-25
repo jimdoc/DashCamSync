@@ -151,6 +151,7 @@ function createCameraCard(camera) {
       <div class="file-browser-actions" hidden>
         <label><input class="file-browser-select-all" type="checkbox"> Select all files</label>
         <span class="file-browser-selection-count"></span>
+        <button class="file-browser-prioritize" type="button" disabled>Download selected</button>
         <button class="file-browser-delete file-browser-delete-selected" type="button" disabled>Delete selected</button>
       </div>
       <div class="file-browser-list"></div>
@@ -191,6 +192,7 @@ function createCameraCard(camera) {
     fileBrowserActions: element.querySelector(".file-browser-actions"),
     fileBrowserSelectAll: element.querySelector(".file-browser-select-all"),
     fileBrowserSelectionCount: element.querySelector(".file-browser-selection-count"),
+    fileBrowserPrioritize: element.querySelector(".file-browser-prioritize"),
     fileBrowserDeleteSelected: element.querySelector(".file-browser-delete-selected"),
     fileBrowserList: element.querySelector(".file-browser-list"),
     fileBrowserClose: element.querySelector(".file-browser-close"),
@@ -210,7 +212,7 @@ function createCameraCard(camera) {
   card.fileBrowserPathValue = "";
   card.fileBrowserRequestId = 0;
   card.fileDeleteRequestId = 0;
-  card.fileDeleteInProgress = false;
+  card.fileActionInProgress = false;
 
   card.rescanButton.addEventListener("click", async () => {
     card.rescanButton.disabled = true;
@@ -257,10 +259,22 @@ function createCameraCard(camera) {
     updateFileSelection(card);
   });
 
+  card.fileBrowserPrioritize.addEventListener("click", async () => {
+    const checkboxes = Array.from(card.fileBrowserList.querySelectorAll(".file-browser-select:checked"))
+      .filter(checkbox => checkbox.dataset.downloadEligible === "true");
+    const paths = checkboxes.map(checkbox => checkbox.value);
+    if (await prioritizeCameraFiles(card, camera, paths)) {
+      for (const checkbox of checkboxes) {
+        checkbox.checked = false;
+      }
+      updateFileSelection(card);
+    }
+  });
+
   card.fileBrowserDeleteSelected.addEventListener("click", async () => {
     const paths = Array.from(card.fileBrowserList.querySelectorAll(".file-browser-select:checked"),
       checkbox => checkbox.value);
-    if (card.fileDeleteInProgress || paths.length === 0) {
+    if (card.fileActionInProgress || paths.length === 0) {
       return;
     }
 
@@ -275,7 +289,7 @@ function createCameraCard(camera) {
 
     const path = card.fileBrowserPathValue;
     const deleteRequestId = ++card.fileDeleteRequestId;
-    setFileDeleteBusy(card, true);
+    setFileBrowserBusy(card, true);
     card.fileDeleteStatus.hidden = false;
     card.fileDeleteStatus.className = "file-delete-status";
     setTextIfChanged(card.fileDeleteStatus, `Deleting ${paths.length} selected file${paths.length === 1 ? "" : "s"}…`);
@@ -315,7 +329,7 @@ function createCameraCard(camera) {
       if (card.fileBrowserPathValue === path) {
         await loadCameraFiles(card, camera, path);
       }
-      setFileDeleteBusy(card, false);
+      setFileBrowserBusy(card, false);
     }
   });
 
@@ -354,26 +368,79 @@ function createCameraCard(camera) {
 }
 
 /**
+ * Prioritizes camera files and reports the result.
+ * @param {object} card Camera card containing the file browser.
+ * @param {object} camera Camera snapshot identifying the camera.
+ * @param {string[]} paths Camera file paths to prioritize.
+ * @returns {Promise<boolean>} Whether the files were accepted.
+ */
+async function prioritizeCameraFiles(card, camera, paths) {
+  if (card.fileActionInProgress || paths.length === 0) {
+    return false;
+  }
+
+  setFileBrowserBusy(card, true);
+  card.fileDeleteStatus.hidden = false;
+  card.fileDeleteStatus.className = "file-delete-status";
+  setTextIfChanged(card.fileDeleteStatus, `Prioritizing ${paths.length} file${paths.length === 1 ? "" : "s"}…`);
+  try {
+    const response = await fetch(
+      `/api/cameras/${encodeURIComponent(camera.ipAddress)}/files/prioritize`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ paths })
+      });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.detail || result.error || `Unable to prioritize files (${response.status})`);
+    }
+
+    if (!Array.isArray(result.queuedPaths)) {
+      throw new Error("The camera returned an invalid priority result.");
+    }
+    const queuedPaths = new Set(result.queuedPaths);
+    if (queuedPaths.size !== paths.length || result.queuedPaths.length !== paths.length
+        || paths.some(path => !queuedPaths.has(path))) {
+      throw new Error("The camera returned an invalid priority result.");
+    }
+
+    card.fileDeleteStatus.className = "file-delete-status success";
+    setTextIfChanged(card.fileDeleteStatus,
+      `${paths.length} file${paths.length === 1 ? "" : "s"} prioritized. The current download will finish first.`);
+    return true;
+  } catch (error) {
+    card.fileDeleteStatus.className = "file-delete-status failure";
+    setTextIfChanged(card.fileDeleteStatus, `Unable to prioritize files: ${error.message}`);
+    return false;
+  } finally {
+    setFileBrowserBusy(card, false);
+  }
+}
+
+/**
  * Updates the file browser's selection count and controls.
  * @param {object} card Camera card containing the file browser.
  */
 function updateFileSelection(card) {
   const checkboxes = Array.from(card.fileBrowserList.querySelectorAll(".file-browser-select"));
   const selected = checkboxes.filter(checkbox => checkbox.checked).length;
+  const downloadable = checkboxes.filter(checkbox => checkbox.checked && checkbox.dataset.downloadEligible === "true").length;
   card.fileBrowserSelectAll.checked = checkboxes.length > 0 && selected === checkboxes.length;
   card.fileBrowserSelectAll.indeterminate = selected > 0 && selected < checkboxes.length;
-  card.fileBrowserSelectAll.disabled = card.fileDeleteInProgress || checkboxes.length === 0;
-  card.fileBrowserDeleteSelected.disabled = card.fileDeleteInProgress || selected === 0;
-  setTextIfChanged(card.fileBrowserSelectionCount, `${selected} selected`);
+  card.fileBrowserSelectAll.disabled = card.fileActionInProgress || checkboxes.length === 0;
+  card.fileBrowserDeleteSelected.disabled = card.fileActionInProgress || selected === 0;
+  card.fileBrowserPrioritize.disabled = card.fileActionInProgress || downloadable === 0;
+  setTextIfChanged(card.fileBrowserSelectionCount, `${selected} selected · ${downloadable} available to download`);
 }
 
 /**
- * Enables or disables file browser controls during deletion.
+ * Enables or disables file browser controls during an action.
  * @param {object} card Camera card containing the file browser.
- * @param {boolean} busy Whether a deletion is in progress.
+ * @param {boolean} busy Whether an action is in progress.
  */
-function setFileDeleteBusy(card, busy) {
-  card.fileDeleteInProgress = busy;
+function setFileBrowserBusy(card, busy) {
+  card.fileActionInProgress = busy;
   card.fileBrowserButton.disabled = busy;
   card.fileBrowserClose.disabled = busy;
   for (const control of card.fileBrowserList.querySelectorAll("button, input")) {
@@ -442,6 +509,7 @@ async function loadCameraFiles(card, camera, path = "") {
         checkbox.type = "checkbox";
         checkbox.className = "file-browser-select";
         checkbox.value = entry.path;
+        checkbox.dataset.downloadEligible = String(entry.downloadStatus === "notDownloaded");
         checkbox.setAttribute("aria-label", `Select ${entry.name}`);
         checkbox.addEventListener("change", () => updateFileSelection(card));
         row.append(checkbox);
@@ -502,9 +570,16 @@ async function loadCameraFiles(card, camera, path = "") {
           case "previouslyDownloadedUnknown":
             downloadStatus.textContent = "Previously downloaded (local copy unknown)";
             break;
-          case "notDownloaded":
-            downloadStatus.textContent = "Not downloaded";
+          case "notDownloaded": {
+            const downloadButton = document.createElement("button");
+            downloadButton.type = "button";
+            downloadButton.className = "file-browser-prioritize file-browser-download-now";
+            downloadButton.textContent = "Download now";
+            downloadButton.setAttribute("aria-label", `Download ${entry.name} now`);
+            downloadButton.addEventListener("click", () => prioritizeCameraFiles(card, camera, [entry.path]));
+            downloadStatus.append(downloadButton);
             break;
+          }
           default:
             downloadStatus.textContent = "Download status unavailable";
         }
@@ -514,7 +589,7 @@ async function loadCameraFiles(card, camera, path = "") {
         deleteButton.className = "file-browser-delete";
         deleteButton.textContent = "Delete";
         deleteButton.addEventListener("click", async () => {
-          if (card.fileDeleteInProgress) {
+          if (card.fileActionInProgress) {
             return;
           }
           const warning = isReadOnly ? "This file is in an RO folder.\n\n" : "";
@@ -523,7 +598,7 @@ async function loadCameraFiles(card, camera, path = "") {
           }
 
           const deleteRequestId = ++card.fileDeleteRequestId;
-          setFileDeleteBusy(card, true);
+          setFileBrowserBusy(card, true);
           card.fileDeleteStatus.hidden = false;
           card.fileDeleteStatus.className = "file-delete-status";
           setTextIfChanged(card.fileDeleteStatus, `Deleting ${entry.path}…`);
@@ -553,7 +628,7 @@ async function loadCameraFiles(card, camera, path = "") {
               setTextIfChanged(card.fileDeleteStatus, `Deletion not confirmed for ${entry.path}: ${error.message}`);
             }
           } finally {
-            setFileDeleteBusy(card, false);
+            setFileBrowserBusy(card, false);
           }
         });
         row.append(deleteButton);
@@ -561,7 +636,7 @@ async function loadCameraFiles(card, camera, path = "") {
 
       card.fileBrowserList.append(row);
     }
-    setFileDeleteBusy(card, card.fileDeleteInProgress);
+    setFileBrowserBusy(card, card.fileActionInProgress);
   } catch (error) {
     if (requestId === card.fileBrowserRequestId) {
       setTextIfChanged(card.fileBrowserPath, `DCIM/${path}`.replace(/\/$/, ""));

@@ -306,6 +306,80 @@ internal static class Program
                 return Results.Problem($"Unable to read the camera directory or download status: {ex.Message}", statusCode: StatusCodes.Status502BadGateway);
             }
         });
+        app.MapPost("/api/cameras/{ipAddress}/files/prioritize", (
+            string ipAddress,
+            [FromBody] CameraFilePriorityRequest? request) =>
+        {
+            if (!cameras.TryGetValue(ipAddress, out string? cameraName))
+            {
+                return Results.NotFound(new { error = "Camera not found." });
+            }
+
+            if (request?.Paths is null || request.Paths.Length == 0)
+            {
+                return Results.BadRequest(new { error = "Select at least one camera file." });
+            }
+
+            List<(string Path, string Name)> files = new List<(string, string)>();
+            HashSet<string> uniquePaths = new HashSet<string>(StringComparer.Ordinal);
+            string? directoryPath = null;
+            foreach (string path in request.Paths)
+            {
+                if (string.IsNullOrEmpty(path)
+                    || !uniquePaths.Add(path)
+                    || !TryResolveCameraPath(ipAddress, path, isDirectory: false, out _))
+                {
+                    return Results.BadRequest(new { error = "Invalid or duplicate camera file path." });
+                }
+
+                string[] segments = path.Split('/');
+                string fileDirectoryPath = string.Join('/', segments.Take(segments.Length - 1));
+                directoryPath ??= fileDirectoryPath;
+                if (!string.Equals(directoryPath, fileDirectoryPath, StringComparison.Ordinal))
+                {
+                    return Results.BadRequest(new { error = "Select files from one camera directory at a time." });
+                }
+
+                files.Add((path, segments[^1]));
+            }
+
+            if (!TryResolveCameraPath(ipAddress, directoryPath!, isDirectory: true, out Uri? directoryUri)
+                || directoryUri is null)
+            {
+                return Results.BadRequest(new { error = "Invalid camera directory path." });
+            }
+
+            try
+            {
+                Dictionary<string, RemoteEntry> listedFiles = GetEntries(directoryUri)
+                    .Where(entry => !entry.IsDirectory)
+                    .ToDictionary(entry => entry.Name, StringComparer.Ordinal);
+                string localRoot = Path.Combine(destinationRoot, cameraName);
+                string localDirectory = Path.Combine(
+                    new[] { localRoot }.Concat(directoryPath!.Split('/', StringSplitOptions.RemoveEmptyEntries)).ToArray());
+                Dictionary<string, DateTime> downloadedFiles = ReadDownloadedFiles(
+                    Path.Combine(localRoot, ".downloaded-files.json"), cameraName, rewrite: false);
+                List<string> fileUris = new List<string>();
+                foreach ((string path, string name) in files)
+                {
+                    if (!listedFiles.TryGetValue(name, out RemoteEntry? entry)
+                        || GetDownloadStatus(entry, localDirectory, downloadedFiles) != "notDownloaded")
+                    {
+                        return Results.Conflict(new { error = $"{path} is no longer available for a first download. Reload the folder and try again." });
+                    }
+
+                    fileUris.Add(entry.Uri.AbsoluteUri);
+                }
+
+                cameraScans[ipAddress].PrioritizeFiles(fileUris);
+                return Results.Accepted(value: new { queuedPaths = files.Select(file => file.Path).ToArray() });
+            }
+            catch (Exception ex) when (IsDownloadException(ex))
+            {
+                Console.Error.WriteLine($"Unable to prioritize files for camera {ipAddress}: {ex.Message}");
+                return Results.Problem($"Unable to prioritize the camera files: {ex.Message}", statusCode: StatusCodes.Status502BadGateway);
+            }
+        });
         app.MapDelete("/api/cameras/{ipAddress}/files", async (
             string ipAddress,
             [FromBody] CameraFileDeleteRequest? request) =>
@@ -802,6 +876,7 @@ internal static class Program
             string manifestPath = Path.Combine(localRoot, ".downloaded-files.json");
             Dictionary<string, DateTime> downloadedFiles = LoadDownloadedFiles(manifestPath, cameraName);
             List<DownloadCandidate> downloads = new List<DownloadCandidate>();
+            Dictionary<string, LinkedListNode<string>> prioritiesAtScanStart = scanCoordinator.GetPriorities();
             Directory.CreateDirectory(localRoot);
             CollectDownloads(remoteRoot, localRoot, cameraName, downloads, progress, cancellationToken);
 
@@ -809,6 +884,9 @@ internal static class Program
                 .OrderBy(download => download.FileTime)
                 .ThenBy(download => download.FileUri.AbsoluteUri, StringComparer.Ordinal)
                 .ToList();
+            scanCoordinator.RemoveMissingPriorities(
+                prioritiesAtScanStart,
+                prioritizedDownloads.Select(download => download.FileUri.AbsoluteUri).ToHashSet(StringComparer.Ordinal));
             int pendingFileCount = 0;
             foreach (DownloadCandidate download in prioritizedDownloads)
             {
@@ -821,11 +899,36 @@ internal static class Program
             }
 
             progress.SetQueue(pendingFileCount);
-            HashSet<string> measuredFiles = MeasureQueueBytes(prioritizedDownloads, downloadedFiles, progress, cancellationToken);
+            HashSet<string> measuredFiles = MeasureQueueBytes(
+                prioritizedDownloads, downloadedFiles, progress, scanCoordinator, cancellationToken);
 
-            foreach (DownloadCandidate download in prioritizedDownloads)
+            LinkedList<DownloadCandidate> remainingDownloads = new LinkedList<DownloadCandidate>(prioritizedDownloads);
+            Dictionary<string, LinkedListNode<DownloadCandidate>> remainingByUri =
+                new Dictionary<string, LinkedListNode<DownloadCandidate>>(StringComparer.Ordinal);
+            for (LinkedListNode<DownloadCandidate>? node = remainingDownloads.First; node is not null; node = node.Next)
+            {
+                remainingByUri.Add(node.Value.FileUri.AbsoluteUri, node);
+            }
+
+            while (remainingDownloads.First is not null)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                string? priorityUri = scanCoordinator.PeekPriority();
+                LinkedListNode<DownloadCandidate> next = remainingDownloads.First;
+                if (priorityUri is not null)
+                {
+                    if (!remainingByUri.TryGetValue(priorityUri, out LinkedListNode<DownloadCandidate>? priorityNode))
+                    {
+                        scanCoordinator.RequestScan();
+                        return completedFileCount;
+                    }
+
+                    next = priorityNode;
+                }
+
+                DownloadCandidate download = next.Value;
+                remainingDownloads.Remove(next);
+                remainingByUri.Remove(download.FileUri.AbsoluteUri);
                 try
                 {
                     long? completedLength = DownloadFile(
@@ -853,6 +956,7 @@ internal static class Program
                     progress.MarkError(ex.Message);
                     PrintDownloadFailure(cameraName, download.FileUri, ex);
                 }
+                scanCoordinator.RemovePriority(download.FileUri.AbsoluteUri);
             }
 
             cancellationToken.ThrowIfCancellationRequested();
@@ -881,12 +985,14 @@ internal static class Program
     /// <param name="downloads">The ordered candidates discovered on the camera.</param>
     /// <param name="downloadedFiles">The manifest of previously downloaded file URIs.</param>
     /// <param name="progress">The state to update with measured queue bytes.</param>
+    /// <param name="scanCoordinator">The coordinator holding priority requests.</param>
     /// <param name="cancellationToken">Cancels the measurement when the scan is interrupted.</param>
     /// <returns>The URIs whose sizes were successfully measured.</returns>
     private static HashSet<string> MeasureQueueBytes(
         List<DownloadCandidate> downloads,
         Dictionary<string, DateTime> downloadedFiles,
         CameraProgress progress,
+        CameraScanCoordinator scanCoordinator,
         CancellationToken cancellationToken)
     {
         HashSet<string> measuredFiles = new HashSet<string>(StringComparer.Ordinal);
@@ -896,6 +1002,12 @@ internal static class Program
         foreach (DownloadCandidate download in downloads)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            if (scanCoordinator.PeekPriority() is not null)
+            {
+                incomplete = true;
+                break;
+            }
+
             string downloadKey = download.FileUri.AbsoluteUri;
             if (downloadedFiles.ContainsKey(downloadKey) || File.Exists(download.DestinationPath))
             {
@@ -2102,8 +2214,81 @@ internal static class Program
         private readonly SemaphoreSlim scanLock = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim pauseLock = new SemaphoreSlim(1, 1);
         private readonly SemaphoreSlim scanRequestSignal = new SemaphoreSlim(0, 1);
+        private readonly LinkedList<string> priorityFiles = new LinkedList<string>();
+        private readonly Dictionary<string, LinkedListNode<string>> priorityNodes =
+            new Dictionary<string, LinkedListNode<string>>(StringComparer.Ordinal);
         private CancellationTokenSource? activeScan;
         private bool pauseRequested;
+
+        /// <summary>Moves requested files to the front of the pending queue and wakes the worker.</summary>
+        public void PrioritizeFiles(IReadOnlyList<string> fileUris)
+        {
+            lock (syncRoot)
+            {
+                for (int i = fileUris.Count - 1; i >= 0; i--)
+                {
+                    string fileUri = fileUris[i];
+                    if (priorityNodes.Remove(fileUri, out LinkedListNode<string>? existing))
+                    {
+                        priorityFiles.Remove(existing);
+                    }
+
+                    priorityNodes.Add(fileUri, priorityFiles.AddFirst(fileUri));
+                }
+
+                if (scanRequestSignal.CurrentCount == 0)
+                {
+                    scanRequestSignal.Release();
+                }
+            }
+        }
+
+        public Dictionary<string, LinkedListNode<string>> GetPriorities()
+        {
+            lock (syncRoot)
+            {
+                return new Dictionary<string, LinkedListNode<string>>(priorityNodes, StringComparer.Ordinal);
+            }
+        }
+
+        public string? PeekPriority()
+        {
+            lock (syncRoot)
+            {
+                return priorityFiles.First?.Value;
+            }
+        }
+
+        public void RemovePriority(string fileUri)
+        {
+            lock (syncRoot)
+            {
+                if (priorityNodes.Remove(fileUri, out LinkedListNode<string>? node))
+                {
+                    priorityFiles.Remove(node);
+                }
+            }
+        }
+
+        public void RemoveMissingPriorities(
+            Dictionary<string, LinkedListNode<string>> previous,
+            HashSet<string> available)
+        {
+            lock (syncRoot)
+            {
+                foreach ((string fileUri, LinkedListNode<string> previousNode) in previous)
+                {
+                    if (!available.Contains(fileUri)
+                        && priorityNodes.TryGetValue(fileUri, out LinkedListNode<string>? currentNode)
+                        && ReferenceEquals(previousNode, currentNode))
+                    {
+                        priorityNodes.Remove(fileUri);
+                        priorityFiles.Remove(currentNode);
+                        Console.Error.WriteLine($"Priority file is no longer available on the camera: {fileUri}");
+                    }
+                }
+            }
+        }
 
         /// <summary>Acquires the scan lock and creates a cancellation source unless a pause is pending.</summary>
         /// <returns>The active scan's cancellation source, or null if a pause was requested.</returns>
@@ -2225,6 +2410,8 @@ internal static class Program
         string? DownloadStatus);
 
     private sealed record CameraFileDeleteRequest(string Path, bool Confirmed);
+
+    private sealed record CameraFilePriorityRequest(string[]? Paths);
 
     private sealed record CameraFileDeleteResponse(string DeletedPath);
 
